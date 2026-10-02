@@ -133,6 +133,39 @@ def score(rows, preds):
     }
 
 
+def summarize(results, total_tasks=None):
+    def mean(key):
+        return sum(s[key] for s in results.values()) / len(results)
+
+    agg = {
+        "avg_f2": mean("f2"),
+        "avg_f1": mean("f1"),
+        "avg_precision": mean("precision"),
+        "avg_recall": mean("recall"),
+    }
+    if total_tasks is not None:
+        agg["complete"] = len(results) == total_tasks
+    return agg
+
+
+def write_payload(args, results, tasks):
+    """Write results to --out. Called after every task, so a long run is never
+    all-or-nothing: partial results are inspectable while it is still going."""
+    if not args.out or not results:
+        return
+    payload = {
+        "benchmark": "PIIMB (piimb/pii-masking-benchmark), sentences/test",
+        "metric": "character-level, label-agnostic, micro-averaged per task",
+        "seed": args.seed,
+        "sample_per_task": args.sample,
+        "threshold": args.threshold,
+        "tasks": results,
+        **summarize(results, len(tasks)),
+    }
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(payload, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", default="./target/release/portcullis")
@@ -181,26 +214,17 @@ def main():
         print(f"{task:18s} n={len(sample):6d}  P={s['precision']:.3f} "
               f"R={s['recall']:.3f}  F1={s['f1']:.3f}  F2={s['f2']:.3f}  "
               f"FPR={s['fpr']:.3f}  ({s['seconds']}s)")
+        if args.out:
+            # Incremental write: partial results are usable mid-run.
+            write_payload(args, results, tasks)
+            print(f"    partial results -> {args.out}")
 
     if results:
-        avg_f2 = sum(s["f2"] for s in results.values()) / len(results)
-        avg_f1 = sum(s["f1"] for s in results.values()) / len(results)
-        avg_p = sum(s["precision"] for s in results.values()) / len(results)
-        avg_r = sum(s["recall"] for s in results.values()) / len(results)
-        print(f"\nAvg F2 = {avg_f2:.4f}   Avg F1 = {avg_f1:.4f}   "
-              f"Avg P = {avg_p:.4f}   Avg R = {avg_r:.4f}")
-        payload = {
-            "benchmark": "PIIMB (piimb/pii-masking-benchmark), sentences/test",
-            "metric": "character-level, label-agnostic, micro-averaged per task",
-            "seed": args.seed, "sample_per_task": args.sample,
-            "threshold": args.threshold, "tasks": results,
-            "avg_f2": avg_f2, "avg_f1": avg_f1,
-            "avg_precision": avg_p, "avg_recall": avg_r,
-        }
+        agg = summarize(results, len(tasks))
+        print(f"\nAvg F2 = {agg['avg_f2']:.4f}   Avg F1 = {agg['avg_f1']:.4f}   "
+              f"Avg P = {agg['avg_precision']:.4f}   Avg R = {agg['avg_recall']:.4f}")
         if args.out:
-            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-            Path(args.out).write_text(json.dumps(payload, indent=2))
-            print(f"wrote {args.out}")
+            print(f"wrote {args.out}  (complete={agg['complete']})")
 
 
 if __name__ == "__main__":
