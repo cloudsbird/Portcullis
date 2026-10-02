@@ -35,11 +35,14 @@ values on the way out, and restores them on the way back. The provider never see
 | **Cursor / Cline / Continue** | OpenAI | "OpenAI-compatible" base-URL override | ✅ |
 | **Aider** | OpenAI | `--openai-api-base` | ✅ |
 | **OpenAI SDK / LangChain / LiteLLM** | OpenAI | `base_url=` | ✅ |
-| **Claude Code** | Anthropic | `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` | 🔜 needs `/v1/messages` + streaming |
-| **Anthropic SDK** | Anthropic | `base_url=` | 🔜 as above |
+| **Claude Code** | Anthropic | `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` | ✅ |
+| **Anthropic SDK** | Anthropic | `base_url=` | ✅ |
 
 **OpenAI protocol** = `POST /v1/chat/completions` (implemented).
-**Anthropic protocol** = `POST /v1/messages` (M3-B, in progress).
+**Anthropic protocol** = `POST /v1/messages` (implemented).
+
+Both are redacted and forwarded in the **same** protocol — Portcullis does not
+translate between them, so tool calls, images and block structure survive intact.
 
 ## Streaming
 
@@ -85,6 +88,9 @@ on the **very next** request — including on messages already seen.
 | `PORTCULLIS_ADMIN_TOKEN` | for `/teach` | Guards the learning surface. Unset → those endpoints return **503** (never open) |
 | `PORTCULLIS_STORE` | no | Where taught terms are persisted (default `store.json`) |
 | `PORTCULLIS_MODEL_DIR` | no | ONNX detector model dir (needs the `onnx` feature) |
+| `PORTCULLIS_ANTHROPIC_UPSTREAM_URL` | for Claude Code | Default `https://api.anthropic.com/v1/messages` |
+| `PORTCULLIS_ANTHROPIC_KEY` | for Claude Code | Anthropic key, sent as `x-api-key` (not a bearer token) |
+| `PORTCULLIS_ANTHROPIC_VERSION` | no | Default `2023-06-01`; a client-supplied version wins |
 
 ## What Portcullis does *not* do
 
