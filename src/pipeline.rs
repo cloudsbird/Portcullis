@@ -13,6 +13,9 @@ pub struct Gateway {
     /// `sha256(original segment) -> redacted segment`. Never stores raw originals.
     cache: HashMap<String, String>,
     regexes: RegexDetector,
+    /// Optional additional detector (e.g. the ONNX GLiNER2 model). Runs *after* the
+    /// deterministic layers, so it can only add recall — never override the guarantee.
+    extra: Option<Box<dyn Detector>>,
 }
 
 impl Gateway {
@@ -22,7 +25,32 @@ impl Gateway {
             vault: Vault::new(),
             cache: HashMap::new(),
             regexes: RegexDetector::new(),
+            extra: None,
         }
+    }
+
+    /// Attach an extra detector (e.g. `OnnxDetector`). Dictionary + regex still run
+    /// first; this only adds recall.
+    pub fn with_detector(mut self, detector: Box<dyn Detector>) -> Self {
+        self.extra = Some(detector);
+        self
+    }
+
+    /// Build a gateway with the default detector stack: the deterministic
+    /// dictionary + regex layers, plus the native ONNX detector when the `onnx`
+    /// feature is enabled and a model is present at `PORTCULLIS_MODEL_DIR`.
+    pub fn with_default_detectors(store: Store) -> Self {
+        // `mut` is only needed when the `onnx` feature is enabled (see below).
+        #[allow(unused_mut)]
+        let mut gw = Gateway::new(store);
+        #[cfg(feature = "onnx")]
+        {
+            match crate::detect_onnx::OnnxDetector::from_env() {
+                Ok(detector) => gw = gw.with_detector(Box::new(detector)),
+                Err(e) => eprintln!("portcullis: ONNX detector disabled ({e})"),
+            }
+        }
+        gw
     }
 
     pub fn vault(&self) -> &Vault {
@@ -57,6 +85,9 @@ impl Gateway {
             dict.detect(seg)
         };
         spans.extend(self.regexes.detect(seg));
+        if let Some(extra) = &self.extra {
+            spans.extend(extra.detect(seg));
+        }
         let spans = merge(spans);
         if spans.is_empty() {
             return seg.to_string();

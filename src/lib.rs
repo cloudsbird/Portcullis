@@ -14,6 +14,8 @@
 //! 4. **Fail closed** — the assembled payload is asserted clean before it leaves.
 
 pub mod detect;
+#[cfg(feature = "onnx")]
+pub mod detect_onnx;
 pub mod pipeline;
 pub mod proxy;
 pub mod store;

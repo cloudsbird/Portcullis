@@ -9,10 +9,15 @@ pub struct Span {
     pub end: usize,
     pub label: String,
     pub source: &'static str,
+    /// Confidence score, when available ( ONNX path ). Dictionary/regex spans set this to 0.0.
+    pub score: f32,
 }
 
 /// Anything that can propose spans. The ONNX/GLiNER2 detector implements this at M1.
-pub trait Detector {
+///
+/// `Send + Sync` is required because the gateway is shared across axum handler
+/// tasks behind an `Arc<Mutex<..>>`.
+pub trait Detector: Send + Sync {
     fn detect(&self, text: &str) -> Vec<Span>;
 }
 
@@ -40,7 +45,7 @@ impl Detector for DictionaryDetector<'_> {
             while let Some(idx) = lower[from..].find(&needle) {
                 let start = from + idx;
                 let end = start + needle.len();
-                spans.push(Span { start, end, label: label.clone(), source: "dictionary" });
+                spans.push(Span { start, end, label: label.clone(), source: "dictionary", score: 0.0 });
                 from = end.max(start + 1);
             }
         }
@@ -83,6 +88,7 @@ impl Detector for RegexDetector {
                     end: m.end(),
                     label: (*label).to_string(),
                     source: "regex",
+                    score: 0.0,
                 });
             }
         }
@@ -90,11 +96,23 @@ impl Detector for RegexDetector {
     }
 }
 
-/// Merge spans, dropping overlaps (leftmost-longest wins).
+/// Source priority: the deterministic layers win over the ML detector on overlap.
+fn source_priority(source: &str) -> u8 {
+    match source {
+        "dictionary" => 0,
+        "regex" => 1,
+        _ => 2,
+    }
+}
+
+/// Merge spans, dropping overlaps: earliest start wins, then highest-priority
+/// source, then longest. This keeps the deterministic dictionary/regex layers
+/// ahead of the ONNX detector — it can add recall, never override the guarantee.
 pub fn merge(mut spans: Vec<Span>) -> Vec<Span> {
     spans.sort_by(|a, b| {
         a.start
             .cmp(&b.start)
+            .then_with(|| source_priority(a.source).cmp(&source_priority(b.source)))
             .then_with(|| (b.end - b.start).cmp(&(a.end - a.start)))
     });
     let mut out: Vec<Span> = Vec::new();

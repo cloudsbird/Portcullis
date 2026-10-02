@@ -40,7 +40,7 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let store = Store::load(&cli.store)?;
-    let gw = Gateway::new(store);
+    let gw = Gateway::with_default_detectors(store);
 
     match cli.command {
         Command::Teach { term, label } => {

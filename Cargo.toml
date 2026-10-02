@@ -8,17 +8,24 @@ repository = "https://github.com/cloudsbird/Portcullis"
 keywords = ["pii", "privacy", "llm", "redaction", "security"]
 categories = ["security", "command-line-utilities"]
 
+[features]
+default = []
+onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+
 [dependencies]
 anyhow = "1"
 axum = "0.7"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+ndarray = { version = "0.17", optional = true }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokenizers = { version = "0.21", optional = true }
+ort = { version = "2.0.0-rc.13", optional = true, features = ["ndarray"] }
 
 [profile.release]
 lto = true

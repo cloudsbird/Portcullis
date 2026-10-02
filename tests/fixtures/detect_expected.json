@@ -1,0 +1,113 @@
+[
+  {
+    "text": "Ping daniel.pratt@northwind-logistics.com about the invoice.",
+    "labels": [
+      "person",
+      "full_name",
+      "email",
+      "phone_number",
+      "account_number",
+      "api_key",
+      "city"
+    ],
+    "entities": [
+      {
+        "text": "daniel.pratt@northwind-logistics.com",
+        "label": "email",
+        "start": 5,
+        "end": 41,
+        "score": 0.9997
+      }
+    ]
+  },
+  {
+    "text": "Hi, I'm Daniel Pratt from Northwind Logistics. Email daniel.pratt@northwind-logistics.com or call +1 415 555 0142.",
+    "labels": [
+      "person",
+      "full_name",
+      "email",
+      "phone_number",
+      "account_number",
+      "api_key",
+      "city"
+    ],
+    "entities": [
+      {
+        "text": "+1 415 555 0142",
+        "label": "phone_number",
+        "start": 98,
+        "end": 113,
+        "score": 1.0
+      },
+      {
+        "text": "daniel.pratt@northwind-logistics.com",
+        "label": "email",
+        "start": 53,
+        "end": 89,
+        "score": 1.0
+      },
+      {
+        "text": "Daniel Pratt",
+        "label": "full_name",
+        "start": 8,
+        "end": 20,
+        "score": 0.9969
+      },
+      {
+        "text": "Daniel Pratt",
+        "label": "person",
+        "start": 8,
+        "end": 20,
+        "score": 0.9639
+      }
+    ]
+  },
+  {
+    "text": "Account 8842019933, key sk-live-9f3aB7cQ, Rotterdam.",
+    "labels": [
+      "person",
+      "full_name",
+      "email",
+      "phone_number",
+      "account_number",
+      "api_key",
+      "city"
+    ],
+    "entities": [
+      {
+        "text": "Rotterdam",
+        "label": "city",
+        "start": 42,
+        "end": 51,
+        "score": 0.9998
+      },
+      {
+        "text": "8842019933",
+        "label": "account_number",
+        "start": 8,
+        "end": 18,
+        "score": 0.9983
+      },
+      {
+        "text": "sk-live-9f3aB7cQ",
+        "label": "api_key",
+        "start": 24,
+        "end": 40,
+        "score": 0.9895
+      }
+    ]
+  },
+  {
+    "text": "No sensitive data in this sentence at all.",
+    "labels": [
+      "person",
+      "full_name",
+      "email",
+      "phone_number",
+      "account_number",
+      "api_key",
+      "city"
+    ],
+    "entities": []
+  }
+]
