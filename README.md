@@ -58,13 +58,28 @@ portcullis --store ./store.json scan \
 
 ## Status
 
-- **M0 (this commit)** — core library + CLI · deterministic dictionary + regex detection ·
-  delta-scan cache · stable vault · the four invariants as passing tests.
-- **M1** — GLiNER2-PII behind an ONNX `/detect` boundary + OpenAI-compatible proxy.
-- **M2** — in-chat `teach` / `unteach` with auto-suggest.
-- **M3** — Hermes integration + benchmarks.
+- **M0** — core library + CLI · deterministic dictionary + regex detection · delta-scan
+  cache · stable vault · the four invariants as passing tests.
+- **M1** — native in-process ONNX GLiNER2-PII detector (no Python at runtime) + an
+  OpenAI-compatible proxy that redacts every text-bearing field and asserts the whole
+  payload before forwarding.
+- **M2** — in-chat `teach` / `unteach` / `terms` / `suggestions` over HTTP, with cache
+  invalidation and bearer auth.
+- **M3** — works with **any** client: SSE streaming (with a placeholder-level carry
+  buffer), the Anthropic Messages API (`/v1/messages`), and a per-client setup matrix.
+- **M4** — packaging and deployment recipes.
 
-See [`docs/prior-art.md`](docs/prior-art.md) and [`docs/threat-model.md`](docs/threat-model.md).
+**28 tests**, organised as the contract: `tests/invariants.rs` is the safety contract,
+then `proxy`, `m2_teach`, `streaming`, `anthropic` and `onnx_detector`.
+
+## Docs
+
+- [**docs/EXAMPLE.md**](docs/EXAMPLE.md) — what the provider actually sees (real before/after, including the learning loop)
+- [**docs/RESOURCES.md**](docs/RESOURCES.md) — measured CPU, RAM, disk and latency
+- [**docs/CLIENTS.md**](docs/CLIENTS.md) — Hermes, OpenCode, Claude Code, Cursor, Aider and more
+- [docs/prior-art.md](docs/prior-art.md) — the landscape, and the one gap this fills
+- [docs/threat-model.md](docs/threat-model.md) — what it does and does not protect
+- [docs/M1-BRIEF.md](docs/M1-BRIEF.md) — the implementation brief
 
 ## License
 
