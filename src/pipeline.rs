@@ -1,8 +1,10 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
 use crate::detect::{merge, Detector, DictionaryDetector, RegexDetector};
+use crate::metrics::Metrics;
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -33,10 +35,13 @@ pub struct Gateway {
     extra: Option<Box<dyn Detector>>,
     /// Recent spans redacted by a non-dictionary detector (regex, ONNX, …).
     suggestions: VecDeque<(Option<String>, String)>,
+    metrics: Arc<Metrics>,
 }
 
 impl Gateway {
     pub fn new(store: Store) -> Self {
+        let metrics = Arc::new(Metrics::new());
+        metrics.set_store_terms(store.deny.len());
         Self {
             store,
             vault: Vault::new(),
@@ -44,6 +49,7 @@ impl Gateway {
             regexes: RegexDetector::new(),
             extra: None,
             suggestions: VecDeque::new(),
+            metrics,
         }
     }
 
@@ -104,6 +110,12 @@ impl Gateway {
         gw
     }
 
+    /// The counters this gateway feeds. Shared, so a scrape never waits on the
+    /// gateway lock.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
+    }
+
     pub fn vault(&self) -> &Vault {
         &self.vault
     }
@@ -161,6 +173,7 @@ impl Gateway {
     pub fn teach_with(&mut self, term: &str, label: &str, scope: &str, whole_word: bool) {
         self.store.teach_with(term, label, scope, whole_word);
         self.cache.clear();
+        self.metrics.set_store_terms(self.store.deny.len());
     }
 
     pub fn unteach(&mut self, term: &str) -> bool {
@@ -170,6 +183,7 @@ impl Gateway {
     /// Remove a term from one scope, or (`None`) from every scope.
     pub fn unteach_in(&mut self, term: &str, scope: Option<&str>) -> bool {
         let changed = self.store.unteach_in(term, scope);
+        self.metrics.set_store_terms(self.store.deny.len());
         if changed {
             self.cache.clear();
         }
@@ -260,12 +274,17 @@ impl Gateway {
         }
         // Compiled once per call, and only if some segment misses the cache.
         let mut dict: Option<DictionaryDetector> = None;
+        let (mut hits, mut misses) = (0u64, 0u64);
         let mut out = Vec::with_capacity(segments.len());
         for seg in segments {
             let h = Self::hash(scope, seg);
             let spans = match self.cache.get(&h) {
-                Some(spans) => spans.clone(),
+                Some(spans) => {
+                    hits += 1;
+                    spans.clone()
+                }
                 None => {
+                    misses += 1;
                     let dict = dict
                         .get_or_insert_with(|| DictionaryDetector::for_scope(&self.store, scope));
                     let spans = self.detect_spans(scope, dict, seg);
@@ -273,8 +292,13 @@ impl Gateway {
                     spans
                 }
             };
+            for s in &spans {
+                self.metrics.redaction(&s.label);
+            }
             out.push(Self::apply_spans(vault, seg, &spans));
         }
+        self.metrics.cache(hits, misses);
+        self.metrics.set_store_terms(self.store.deny.len());
         out
     }
 

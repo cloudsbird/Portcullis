@@ -57,6 +57,14 @@ pub(super) fn require_admin(
     state: &ProxyState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
+    let result = check_admin(state, headers);
+    if matches!(result, Err((StatusCode::UNAUTHORIZED, _))) {
+        state.metrics.blocked("unauthorized_admin");
+    }
+    result
+}
+
+fn check_admin(state: &ProxyState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
     let token: String = match state.admin_token.as_deref() {
         Some(t) if !t.is_empty() => t.to_string(),
         _ => match std::env::var("PORTCULLIS_ADMIN_TOKEN") {

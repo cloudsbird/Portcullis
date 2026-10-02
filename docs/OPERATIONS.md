@@ -69,6 +69,7 @@ PORTCULLIS_FORWARD_HEADERS='x-opencode-session'
 |---|---|---|
 | `PORTCULLIS_LOG` | `info` | `tracing` filter, e.g. `info,portcullis=debug` |
 | `PORTCULLIS_LOG_FORMAT` | text | set to `json` for one JSON object per line |
+| `PORTCULLIS_METRICS_TOKEN` | — | require this bearer token on `/metrics` (default: open) |
 
 One line per request with method, path, status and duration. **Bodies and headers are
 never logged**, so no prompt content, taught term or credential can reach your logs.
@@ -76,6 +77,48 @@ never logged**, so no prompt content, taught term or credential can reach your l
 ```
 2026-10-02T04:12:09Z  INFO portcullis::proxy: request method=POST path=/v1/chat/completions status=200 ms=412
 ```
+
+## Metrics
+
+`GET /metrics` serves Prometheus text format (`text/plain; version=0.0.4`). It is open by
+default, like `/healthz`; set `PORTCULLIS_METRICS_TOKEN` to require
+`Authorization: Bearer <token>`. It never waits on the gateway lock, so a scrape is not
+queued behind a slow scan.
+
+**No value ever appears in a metric.** Labels come from small fixed sets — route, status,
+redaction label, block reason, configured scope names — and every open-ended set is capped at
+64 series (the rest fold into `other`). Unknown URLs collapse into `route="other"`, so a
+scanner cannot mint series.
+
+| Metric | Type | Labels | Answers |
+|---|---|---|---|
+| `portcullis_http_requests_total` | counter | `route`, `status` | traffic and error rate |
+| `portcullis_http_request_duration_seconds` | histogram | `route` | latency to response headers (a stream's body time is not included) |
+| `portcullis_redactions_total` | counter | `label` | how much is being hidden, by kind |
+| `portcullis_delta_cache_total` | counter | `result` | delta-cache hit rate |
+| `portcullis_blocked_total` | counter | `reason` | `residual_term` / `malformed_placeholder` (fail-closed), `unauthorized_scope`, `unauthorized_admin` |
+| `portcullis_scan_duration_seconds` | histogram | — | detection cost per request |
+| `portcullis_gateway_lock_wait_seconds` | histogram | — | **queueing** behind the single gateway lock; rising means detection is your bottleneck |
+| `portcullis_upstream_responses_total` | counter | `outcome` | provider status codes, `timeout`, `error` |
+| `portcullis_upstream_duration_seconds` | histogram | — | provider latency |
+| `portcullis_scope_requests_total` | counter | `scope` | per-client traffic (only with scopes enabled) |
+| `portcullis_store_terms` | gauge | — | taught terms |
+| `portcullis_uptime_seconds`, `portcullis_build_info` | gauge | `version` | process basics |
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: portcullis
+    static_configs: [{ targets: ["127.0.0.1:8080"] }]
+    # authorization: { credentials_file: /etc/prometheus/portcullis.token }   # if a token is set
+```
+
+Worth alerting on: `increase(portcullis_blocked_total{reason=~"residual_term|malformed_placeholder"}[5m]) > 0`
+(the fail-closed assertion fired — something nearly leaked), a sustained non-zero
+`portcullis_gateway_lock_wait_seconds`, and 5xx or `timeout` in `portcullis_upstream_responses_total`.
+
+Not implemented: **OTLP / distributed tracing.** Metrics are Prometheus-only, and logs remain
+structured JSON (`PORTCULLIS_LOG_FORMAT=json`).
 
 ## Concurrency
 
@@ -160,7 +203,7 @@ What is **not** closed, and I would not pretend otherwise:
    [SCOPES.md](SCOPES.md): per-client tokens pick which terms apply, but the operator,
    the store file, the provider key and the detector are shared.
 4. **Detection serialises** (see Concurrency), so throughput is bounded.
-5. **No metrics/tracing export** — logs only, no Prometheus/OTLP.
+5. **No OTLP / tracing export.** Prometheus metrics exist (see Metrics above); distributed tracing does not.
 
 ## Live end-to-end test
 

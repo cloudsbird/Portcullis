@@ -68,6 +68,11 @@ pub struct ProxyState {
     /// applies to every request. Non-empty means every request must present one of
     /// these tokens and only sees `global` terms plus its own scope's.
     pub scope_tokens: Vec<(String, String)>,
+    /// Counters behind `/metrics`. Shared with the gateway, so a scrape never waits
+    /// on the gateway lock.
+    pub metrics: Arc<crate::Metrics>,
+    /// Bearer token required by `/metrics`. `None`: open, like `/healthz`.
+    pub metrics_token: Option<String>,
 }
 
 impl ProxyState {
@@ -77,6 +82,7 @@ impl ProxyState {
         upstream_url: String,
         upstream_key: String,
     ) -> Self {
+        let metrics = gateway.metrics();
         Self {
             gateway: Arc::new(Mutex::new(gateway)),
             client,
@@ -92,6 +98,8 @@ impl ProxyState {
             forward_headers: Vec::new(),
             extra_upstream_headers: Vec::new(),
             scope_tokens: Vec::new(),
+            metrics,
+            metrics_token: None,
         }
     }
 }
@@ -190,13 +198,20 @@ async fn send_upstream(
         if !streaming {
             request = request.timeout(state.request_timeout);
         }
+        let sent = Instant::now();
         match request.send().await {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                state
+                    .metrics
+                    .upstream(response.status().as_str(), sent.elapsed().as_secs_f64());
+                return Ok(response);
+            }
             Err(e) if attempt < MAX_CONNECT_ATTEMPTS && e.is_connect() => {
                 tracing::warn!(error = %e, attempt, "upstream connect failed; retrying");
             }
             Err(e) => {
                 let kind = if e.is_timeout() { "timeout" } else { "error" };
+                state.metrics.upstream(kind, sent.elapsed().as_secs_f64());
                 return Err((StatusCode::BAD_GATEWAY, format!("upstream {kind}: {e}")));
             }
         }
@@ -205,11 +220,16 @@ async fn send_upstream(
 
 /// One log line per request. Bodies and headers are never logged, so no prompt
 /// content, term or credential can end up in the logs.
-async fn log_requests(req: Request, next: Next) -> Response {
+async fn log_requests(State(state): State<ProxyState>, req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let started = Instant::now();
     let response = next.run(req).await;
+    state.metrics.request(
+        crate::metrics::route_label(&path),
+        response.status().as_u16(),
+        started.elapsed().as_secs_f64(),
+    );
     tracing::info!(
         method = %method,
         path = %path,
@@ -218,6 +238,30 @@ async fn log_requests(req: Request, next: Next) -> Response {
         "request"
     );
     response
+}
+
+/// Prometheus scrape endpoint. Counts and timings only — never a term, a value or a
+/// key. Open by default like `/healthz`; set `PORTCULLIS_METRICS_TOKEN` to require a
+/// bearer token (Prometheus: `authorization: { credentials: … }`).
+async fn metrics_handler(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
+    if let Some(token) = state.metrics_token.as_deref() {
+        let provided = headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !admin::constant_time_eq(provided, token) {
+            return (StatusCode::UNAUTHORIZED, "invalid or missing bearer token").into_response();
+        }
+    }
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.metrics.render(),
+    )
+        .into_response()
 }
 
 /// Liveness and readiness probe. Unauthenticated, and deliberately reports only
@@ -252,13 +296,14 @@ pub fn app(state: ProxyState) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics_handler))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(anthropic_messages))
         .route("/teach", post(admin::teach_handler))
         .route("/unteach", post(admin::unteach_handler))
         .route("/terms", get(admin::terms_handler))
         .route("/suggestions", get(admin::suggestions_handler))
-        .layer(middleware::from_fn(log_requests))
+        .layer(middleware::from_fn_with_state(state.clone(), log_requests))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
@@ -350,6 +395,9 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
     state.store_path = Some(store_path);
     state.admin_token = admin_token;
     state.scope_tokens = scope_tokens;
+    state.metrics_token = std::env::var("PORTCULLIS_METRICS_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     state.anthropic_upstream_url = anthropic_upstream_url;
     state.anthropic_upstream_key = anthropic_upstream_key;
     state.anthropic_version = anthropic_version;
@@ -368,6 +416,7 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
         admin_api = state.admin_token.is_some(),
         store_encrypted = crate::Store::is_encrypted(state.store_path.as_deref().unwrap_or("store.json")),
         scopes = state.scope_tokens.len(),
+        metrics_auth = state.metrics_token.is_some(),
         "portcullis listening"
     );
 
@@ -471,10 +520,16 @@ pub(super) fn resolve_scope(
         }
     }
     match found {
-        Some(scope) => Ok(Some(scope.to_string())),
-        None => Err((
-            StatusCode::UNAUTHORIZED,
-            "missing or invalid scope token".into(),
-        )),
+        Some(scope) => {
+            state.metrics.scope_request(scope);
+            Ok(Some(scope.to_string()))
+        }
+        None => {
+            state.metrics.blocked("unauthorized_scope");
+            Err((
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid scope token".into(),
+            ))
+        }
     }
 }

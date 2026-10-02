@@ -252,6 +252,7 @@ Everything is environment variables. The ones that matter most:
 | `PORTCULLIS_MODEL_DIR` | `./model` | detector directory |
 | `PORTCULLIS_THRESHOLD` | `0.5` | detector confidence cut-off |
 | `PORTCULLIS_LOG_FORMAT` | text | `json` for structured logs |
+| `PORTCULLIS_METRICS_TOKEN` | — | require a bearer token on `/metrics` (default: open) |
 
 Full reference, including timeouts, body limits, header forwarding and the health
 endpoint: [docs/OPERATIONS.md](docs/OPERATIONS.md). Provider-by-provider setup:
@@ -345,7 +346,7 @@ no mock had caught.
   `/v1/messages` path is mock-tested only.
 - **Detection serialises** behind one lock, so throughput is bounded (~3–4 scans/second on
   the reference host; far better in practice because only new text is scanned).
-- **No metrics or tracing export** — structured logs only.
+- **No OTLP / tracing export** — Prometheus `/metrics` and structured logs only.
 
 All of these are stated in full, with reproduction steps, in
 [docs/OPERATIONS.md](docs/OPERATIONS.md#before-this-guards-someone-elses-data).
@@ -361,7 +362,7 @@ All of these are stated in full, with reproduction steps, in
 | ✅ | **M4** — packaging: Docker, compose, systemd, and a deployment guide |
 | ✅ | **M5** — per-client `scope` enforcement via per-client tokens; multi-tenant isolation demonstrated in `tests/scopes.rs` |
 | ✅ | **M6** — encryption at rest for the learned store (Argon2id + AES-256-GCM, opt-in) |
-| | **M7** — metrics export (Prometheus/OTLP) |
+| ✅ | **M7** — Prometheus `/metrics` (counters and latency histograms; no values ever). OTLP / tracing is not done |
 
 ## Documentation
 
@@ -391,6 +392,7 @@ All of these are stated in full, with reproduction steps, in
 | `GET` | `/terms` | bearer | list the store |
 | `GET` | `/suggestions` | bearer | terms detected but not yet taught |
 | `GET` | `/healthz` | none | liveness; returns counts only, never a term or a value |
+| `GET` | `/metrics` | open or bearer | Prometheus metrics ([OPERATIONS.md](docs/OPERATIONS.md#metrics)) |
 
 ## Maintainers
 

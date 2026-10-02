@@ -228,9 +228,14 @@ pub(super) async fn handle_anthropic(
         let texts = texts_to_redact.clone();
         let scope = scope.clone();
         tokio::task::spawn_blocking(move || {
+            let waited = Instant::now();
             let mut gw = gateway.blocking_lock();
+            let lock_wait = waited.elapsed().as_secs_f64();
+            let scanning = Instant::now();
             let mut vault = Vault::new();
             let out = gw.process_scoped(scope.as_deref(), &mut vault, &texts);
+            gw.metrics()
+                .scan(lock_wait, scanning.elapsed().as_secs_f64());
             (out, vault)
         })
         .await
@@ -254,7 +259,14 @@ pub(super) async fn handle_anthropic(
         let assembled = serde_json::to_string(&redacted_body)
             .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
         gw.assert_clean_scoped(scope.as_deref(), &[assembled])
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            .map_err(|e| {
+                state.metrics.blocked(if e.contains("residual") {
+                    "residual_term"
+                } else {
+                    "malformed_placeholder"
+                });
+                (StatusCode::BAD_GATEWAY, e)
+            })?;
     }
 
     let streaming = body

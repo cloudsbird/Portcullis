@@ -17,6 +17,7 @@ pub mod crypt;
 pub mod detect;
 #[cfg(feature = "onnx")]
 pub mod detect_onnx;
+pub mod metrics;
 pub mod model;
 pub mod pipeline;
 pub mod proxy;
@@ -24,6 +25,7 @@ pub mod store;
 pub mod vault;
 
 pub use crypt::StoreKey;
+pub use metrics::Metrics;
 pub use model::DetectorSettings;
 pub use pipeline::Gateway;
 pub use store::{applies, Entry, HiddenForm, Store, GLOBAL_SCOPE};
