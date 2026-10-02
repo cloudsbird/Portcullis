@@ -16,11 +16,13 @@
 pub mod detect;
 #[cfg(feature = "onnx")]
 pub mod detect_onnx;
+pub mod model;
 pub mod pipeline;
 pub mod proxy;
 pub mod store;
 pub mod vault;
 
 pub use pipeline::Gateway;
+pub use model::DetectorSettings;
 pub use store::{Entry, Store};
 pub use vault::Vault;

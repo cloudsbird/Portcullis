@@ -88,6 +88,10 @@ on the **very next** request — including on messages already seen.
 | `PORTCULLIS_ADMIN_TOKEN` | for `/teach` | Guards the learning surface. Unset → those endpoints return **503** (never open) |
 | `PORTCULLIS_STORE` | no | Where taught terms are persisted (default `store.json`) |
 | `PORTCULLIS_MODEL_DIR` | no | ONNX detector model dir (needs the `onnx` feature) |
+| `PORTCULLIS_MODEL` | no | Name of a detector from the registry (see [MODELS.md](MODELS.md)) |
+| `PORTCULLIS_MODELS` | no | Path to the model registry (default `portcullis.models.json`) |
+| `PORTCULLIS_LABELS` | no | Comma-separated label set for the detector |
+| `PORTCULLIS_THRESHOLD` | no | Confidence threshold (default 0.5; the benchmark uses 0.3) |
 | `PORTCULLIS_ANTHROPIC_UPSTREAM_URL` | for Claude Code | Default `https://api.anthropic.com/v1/messages` |
 | `PORTCULLIS_ANTHROPIC_KEY` | for Claude Code | Anthropic key, sent as `x-api-key` (not a bearer token) |
 | `PORTCULLIS_ANTHROPIC_VERSION` | no | Default `2023-06-01`; a client-supplied version wins |

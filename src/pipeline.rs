@@ -59,6 +59,38 @@ impl Gateway {
         gw
     }
 
+    /// Build a gateway from resolved [`DetectorSettings`] — the path the CLI and
+    /// the proxy use, so a named model preset supplies the directory, its label
+    /// set and its threshold together.
+    pub fn with_settings(store: Store, settings: &crate::model::DetectorSettings) -> Self {
+        // `mut` is only needed when the `onnx` feature is enabled (see below).
+        #[allow(unused_mut)]
+        let mut gw = Gateway::new(store);
+        #[cfg(feature = "onnx")]
+        {
+            match crate::detect_onnx::OnnxDetector::from_dir(&settings.dir) {
+                Ok(mut detector) => {
+                    if let Some(labels) = &settings.labels {
+                        detector = detector.with_labels(labels.clone());
+                    }
+                    if let Some(threshold) = settings.threshold {
+                        detector = detector.with_threshold(threshold);
+                    }
+                    gw = gw.with_detector(Box::new(detector));
+                }
+                Err(e) => {
+                    let which = settings
+                        .model_name
+                        .as_deref()
+                        .map(|n| format!(" [model '{n}']"))
+                        .unwrap_or_default();
+                    eprintln!("portcullis: detector disabled ({e}){which}");
+                }
+            }
+        }
+        gw
+    }
+
     pub fn vault(&self) -> &Vault {
         &self.vault
     }

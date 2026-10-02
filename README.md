@@ -122,6 +122,7 @@ then `proxy`, `m2_teach`, `streaming`, `anthropic` and `onnx_detector`.
 ## Docs
 
 - [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md) — how a prompt flows end to end (diagrams)
+- [**docs/MODELS.md**](docs/MODELS.md) — choosing a detector: the registry, precedence, and what's supported
 - [**docs/TEACHING.md**](docs/TEACHING.md) — how the learning loop works, and what it does *not* do yet
 - [**docs/EXAMPLE.md**](docs/EXAMPLE.md) — what the provider actually sees (real before/after, including the learning loop)
 - [**docs/RESOURCES.md**](docs/RESOURCES.md) — measured CPU, RAM, disk and latency

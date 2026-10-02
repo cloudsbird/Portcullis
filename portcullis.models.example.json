@@ -1,0 +1,34 @@
+{
+  "default": "general",
+  "models": {
+    "general": {
+      "dir": "./model",
+      "labels": [
+        "person",
+        "full_name",
+        "email",
+        "phone_number",
+        "account_number",
+        "api_key",
+        "city"
+      ],
+      "threshold": 0.5,
+      "description": "GLiNER2-PII (307M). Balanced default. Natural label names."
+    },
+    "recall": {
+      "dir": "./model",
+      "threshold": 0.3,
+      "description": "Same model, lower threshold. Catches more, over-masks more. This is the setting the PIIMB benchmark uses."
+    },
+    "precision": {
+      "dir": "./model",
+      "threshold": 0.7,
+      "description": "Same model, higher threshold. Masks less, misses more. For chatty prose where over-masking hurts."
+    },
+    "small": {
+      "dir": "./models/gliner2-small",
+      "threshold": 0.4,
+      "description": "EXAMPLE - point this at a smaller GLiNER2 export for low-RAM hosts (~50 MB instead of ~1.6 GB resident)."
+    }
+  }
+}
