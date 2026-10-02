@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -7,6 +8,22 @@ use crate::detect::{merge, Detector, DictionaryDetector, RegexDetector};
 use crate::metrics::Metrics;
 use crate::store::Store;
 use crate::vault::Vault;
+
+/// `scope -> (deny-list fingerprint, compiled dictionary)`.
+type DictCache = HashMap<Option<String>, (u64, Arc<DictionaryDetector>)>;
+
+/// Distinct scopes whose compiled dictionaries are kept (the scope set is configured, so
+/// this is only a backstop).
+const DICT_CACHE_LIMIT: usize = 64;
+
+/// A hash of everything in the deny-list that affects matching.
+fn deny_fingerprint(store: &Store) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for e in &store.deny {
+        (&e.term, &e.label, &e.scope, &e.aliases, e.whole_word).hash(&mut h);
+    }
+    h.finish()
+}
 
 /// Widen `start..end` outward to character boundaries and clamp to the segment.
 /// `None` only for an empty or out-of-range span. Widening, never dropping, is the
@@ -51,6 +68,9 @@ pub struct Gateway {
     /// Recent spans redacted by a non-dictionary detector (regex, ONNX, …).
     suggestions: VecDeque<(Option<String>, String)>,
     metrics: Arc<Metrics>,
+    /// Compiled dictionaries by scope, each tagged with the fingerprint of the deny-list
+    /// it was built from.
+    dicts: Mutex<DictCache>,
 }
 
 impl Gateway {
@@ -65,6 +85,7 @@ impl Gateway {
             extra: None,
             suggestions: VecDeque::new(),
             metrics,
+            dicts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -129,6 +150,29 @@ impl Gateway {
     /// gateway lock.
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
+    }
+
+    /// The compiled dictionary for `scope`, reused across requests.
+    ///
+    /// Compiling it is the expensive part of a dictionary scan (one regex over every
+    /// term), so it is cached. The cache is validated against a fingerprint of the
+    /// deny-list on every call, not invalidated by hooks: `store` is a public field and
+    /// can be edited directly, and a stale dictionary would silently miss a new term.
+    fn dictionary(&self, scope: Option<&str>) -> Arc<DictionaryDetector> {
+        let fingerprint = deny_fingerprint(&self.store);
+        let key = scope.map(str::to_string);
+        let mut cache = self.dicts.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((fp, dict)) = cache.get(&key) {
+            if *fp == fingerprint {
+                return dict.clone();
+            }
+        }
+        if cache.len() >= DICT_CACHE_LIMIT {
+            cache.clear();
+        }
+        let dict = Arc::new(DictionaryDetector::for_scope(&self.store, scope));
+        cache.insert(key, (fingerprint, dict.clone()));
+        dict
     }
 
     pub fn vault(&self) -> &Vault {
@@ -298,7 +342,7 @@ impl Gateway {
             self.cache.clear();
         }
         // Compiled once per call, and only if some segment misses the cache.
-        let mut dict: Option<DictionaryDetector> = None;
+        let mut dict: Option<Arc<DictionaryDetector>> = None;
         let (mut hits, mut misses) = (0u64, 0u64);
         let mut out = Vec::with_capacity(segments.len());
         for seg in segments {
@@ -310,9 +354,8 @@ impl Gateway {
                 }
                 None => {
                     misses += 1;
-                    let dict = dict
-                        .get_or_insert_with(|| DictionaryDetector::for_scope(&self.store, scope));
-                    let spans = self.detect_spans(scope, dict, seg);
+                    let dict = dict.get_or_insert_with(|| self.dictionary(scope)).clone();
+                    let spans = self.detect_spans(scope, &dict, seg);
                     self.cache.insert(h, spans.clone());
                     spans
                 }
@@ -347,7 +390,7 @@ impl Gateway {
         scope: Option<&str>,
         outbound: &[String],
     ) -> Result<(), String> {
-        let dict = DictionaryDetector::for_scope(&self.store, scope);
+        let dict = self.dictionary(scope);
         for seg in outbound {
             for span in dict.detect(seg) {
                 if !self.store.is_allowed_for(scope, &seg[span.start..span.end]) {
