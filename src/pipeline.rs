@@ -62,6 +62,7 @@ impl Gateway {
     /// Build a gateway from resolved [`DetectorSettings`] — the path the CLI and
     /// the proxy use, so a named model preset supplies the directory, its label
     /// set and its threshold together.
+    #[cfg_attr(not(feature = "onnx"), allow(unused_variables))]
     pub fn with_settings(store: Store, settings: &crate::model::DetectorSettings) -> Self {
         // `mut` is only needed when the `onnx` feature is enabled (see below).
         #[allow(unused_mut)]

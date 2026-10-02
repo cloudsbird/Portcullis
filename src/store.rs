@@ -43,8 +43,36 @@ impl Store {
         Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
     }
 
+    /// Persist the store.
+    ///
+    /// On Unix the file is created with `0600`. It is a map of everything you
+    /// consider private, and there is no encryption at rest yet — so at minimum
+    /// it must not be world-readable.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let path = path.as_ref();
+        let raw = serde_json::to_string_pretty(self)?;
+
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?;
+            file.write_all(raw.as_bytes())?;
+
+            // `.create(true)` does not change the mode of a file that already
+            // exists, so tighten a pre-existing store too.
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        #[cfg(not(unix))]
+        std::fs::write(path, raw)?;
+
         Ok(())
     }
 

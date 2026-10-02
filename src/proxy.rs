@@ -6,8 +6,9 @@
 
 use axum::{
     body::{Body, Bytes},
-    extract::State,
+    extract::{DefaultBodyLimit, Request, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -19,10 +20,19 @@ use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::Gateway;
+
+/// Attempts made when the *connection* fails. A connect error means the request
+/// never reached the provider, so retrying cannot double-charge or double-generate.
+const MAX_CONNECT_ATTEMPTS: u32 = 2;
+
+/// Default request-body cap (2 MiB). Detection cost grows with input length, so
+/// an unbounded body is an easy way to stall the gateway.
+const DEFAULT_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Shared state for the proxy handler.
 #[derive(Clone)]
@@ -43,6 +53,12 @@ pub struct ProxyState {
     pub anthropic_upstream_key: String,
     /// Default `anthropic-version` header when the client does not supply one.
     pub anthropic_version: String,
+    /// Total timeout for non-streaming upstream requests. Streaming requests are
+    /// exempt — a long generation is not a hang — and rely on the HTTP client's
+    /// per-read timeout instead.
+    pub request_timeout: Duration,
+    /// Process start time, for `/healthz`.
+    pub started_at: Instant,
 }
 
 impl ProxyState {
@@ -57,8 +73,84 @@ impl ProxyState {
             anthropic_upstream_url: "https://api.anthropic.com/v1/messages".into(),
             anthropic_upstream_key: String::new(),
             anthropic_version: "2023-06-01".into(),
+            request_timeout: Duration::from_secs(600),
+            started_at: Instant::now(),
         }
     }
+}
+
+/// Parse a positive integer number of seconds from the environment.
+fn env_secs(key: &str, default: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default),
+    )
+}
+
+/// Forward to the upstream provider, applying the configured timeout and
+/// retrying once only when the connection itself failed.
+///
+/// Deliberately **not** retried: HTTP 5xx responses and timeouts after the request
+/// was sent. Against an LLM provider those can mean the request was already
+/// processed, so a silent retry would double-charge and generate twice.
+async fn send_upstream(
+    state: &ProxyState,
+    streaming: bool,
+    build: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, (StatusCode, String)> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut request = build();
+        if !streaming {
+            request = request.timeout(state.request_timeout);
+        }
+        match request.send().await {
+            Ok(response) => return Ok(response),
+            Err(e) if attempt < MAX_CONNECT_ATTEMPTS && e.is_connect() => {
+                tracing::warn!(error = %e, attempt, "upstream connect failed; retrying");
+            }
+            Err(e) => {
+                let kind = if e.is_timeout() { "timeout" } else { "error" };
+                return Err((StatusCode::BAD_GATEWAY, format!("upstream {kind}: {e}")));
+            }
+        }
+    }
+}
+
+/// One log line per request. Bodies and headers are never logged, so no prompt
+/// content, term or credential can end up in the logs.
+async fn log_requests(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = Instant::now();
+    let response = next.run(req).await;
+    tracing::info!(
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        ms = started.elapsed().as_millis() as u64,
+        "request"
+    );
+    response
+}
+
+/// Liveness and readiness probe. Unauthenticated, and deliberately reports only
+/// counts — never a term, a value or a key.
+async fn healthz(State(state): State<ProxyState>) -> Json<Value> {
+    let store_terms = {
+        let gw = state.gateway.lock().await;
+        gw.store.deny.len()
+    };
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": state.started_at.elapsed().as_secs(),
+        "store_terms": store_terms,
+    }))
 }
 
 /// Walk a message and collect every redactable text string into `out`,
@@ -367,9 +459,22 @@ async fn handle(state: ProxyState, body: Value) -> Result<Response, (StatusCode,
     }
 
     // Redact all text-bearing strings in one batch (better cache hit rate).
+    // Detection is CPU-bound and synchronous, so it runs on the blocking pool
+    // rather than stalling an async worker thread.
     let redacted_texts = {
-        let mut gw = state.gateway.lock().await;
-        gw.process(&texts_to_redact)
+        let gateway = state.gateway.clone();
+        let texts = texts_to_redact.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut gw = gateway.blocking_lock();
+            gw.process(&texts)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("redaction task failed: {e}"),
+            )
+        })?
     };
 
     // Place redacted strings back into the message copies.
@@ -399,14 +504,14 @@ async fn handle(state: ProxyState, body: Value) -> Result<Response, (StatusCode,
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let upstream_resp = state
-        .client
-        .post(&state.upstream_url)
-        .bearer_auth(&state.upstream_key)
-        .json(&upstream_body)
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let upstream_resp = send_upstream(&state, streaming, || {
+        state
+            .client
+            .post(&state.upstream_url)
+            .bearer_auth(&state.upstream_key)
+            .json(&upstream_body)
+    })
+    .await?;
 
     if streaming {
         return stream_response(state, upstream_resp).await;
@@ -462,9 +567,22 @@ async fn handle_anthropic(
     collect_anthropic_texts(&mut redacted_body, &mut texts_to_redact);
 
     // Redact all text-bearing strings in one batch (better cache hit rate).
+    // Detection is CPU-bound and synchronous, so it runs on the blocking pool
+    // rather than stalling an async worker thread.
     let redacted_texts = {
-        let mut gw = state.gateway.lock().await;
-        gw.process(&texts_to_redact)
+        let gateway = state.gateway.clone();
+        let texts = texts_to_redact.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut gw = gateway.blocking_lock();
+            gw.process(&texts)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("redaction task failed: {e}"),
+            )
+        })?
     };
 
     // Place redacted strings back into the request copy.
@@ -494,16 +612,16 @@ async fn handle_anthropic(
         .map(|s| s.to_string())
         .unwrap_or_else(|| state.anthropic_version.clone());
 
-    let upstream_resp = state
-        .client
-        .post(&state.anthropic_upstream_url)
-        .header("x-api-key", &state.anthropic_upstream_key)
-        .header("anthropic-version", &version)
-        .header("content-type", "application/json")
-        .json(&redacted_body)
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let upstream_resp = send_upstream(&state, streaming, || {
+        state
+            .client
+            .post(&state.anthropic_upstream_url)
+            .header("x-api-key", &state.anthropic_upstream_key)
+            .header("anthropic-version", &version)
+            .header("content-type", "application/json")
+            .json(&redacted_body)
+    })
+    .await?;
 
     if streaming {
         return anthropic_stream_response(state, upstream_resp).await;
@@ -1097,13 +1215,22 @@ async fn suggestions_handler(State(state): State<ProxyState>, headers: HeaderMap
 }
 
 pub fn app(state: ProxyState) -> Router {
+    let max_body = std::env::var("PORTCULLIS_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_BODY_BYTES);
+
     Router::new()
+        .route("/healthz", get(healthz))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(anthropic_messages))
         .route("/teach", post(teach_handler))
         .route("/unteach", post(unteach_handler))
         .route("/terms", get(terms_handler))
         .route("/suggestions", get(suggestions_handler))
+        .layer(middleware::from_fn(log_requests))
+        .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
 
@@ -1131,11 +1258,25 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
     let anthropic_version = std::env::var("PORTCULLIS_ANTHROPIC_VERSION")
         .unwrap_or_else(|_| "2023-06-01".into());
 
+    // Timeouts — a hung provider must not hang the client forever.
+    //  * connect_timeout caps connection establishment.
+    //  * read_timeout caps the gap *between* bytes, which is what catches a stalled
+    //    stream while still allowing a genuinely long generation.
+    //  * request_timeout caps a whole non-streaming call. It is applied per request
+    //    in `send_upstream`, and never to streaming requests (it would kill them).
+    let connect_timeout = env_secs("PORTCULLIS_CONNECT_TIMEOUT_SECS", 10);
+    let read_timeout = env_secs("PORTCULLIS_READ_TIMEOUT_SECS", 180);
+    let request_timeout = env_secs("PORTCULLIS_REQUEST_TIMEOUT_SECS", 600);
+
     let client = Client::builder()
         .use_rustls_tls()
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .pool_idle_timeout(Duration::from_secs(90))
         .build()?;
 
     let mut state = ProxyState::new(gateway, client, upstream_url, upstream_key);
+    state.request_timeout = request_timeout;
     state.store_path = Some(store_path);
     state.admin_token = admin_token;
     state.anthropic_upstream_url = anthropic_upstream_url;

@@ -73,6 +73,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_tracing();
     let command = cli.command;
 
     // `models` only needs the registry, not a loaded detector.
@@ -126,6 +127,28 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Initialise logging.
+///
+/// `PORTCULLIS_LOG` sets the filter (default `info`); `PORTCULLIS_LOG_FORMAT=json`
+/// switches to JSON lines for log shippers. Values never appear in logs — only
+/// counts, statuses and timings.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let filter = EnvFilter::try_from_env("PORTCULLIS_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let want_json = std::env::var("PORTCULLIS_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    let builder = fmt().with_env_filter(filter);
+    // Already-initialised (e.g. across tests) is not an error.
+    if want_json {
+        let _ = builder.json().try_init();
+    } else {
+        let _ = builder.try_init();
+    }
 }
 
 /// Print the detectors available in the registry, and how to select one.
