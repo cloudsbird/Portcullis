@@ -125,7 +125,12 @@ pub struct DetectorSettings {
 impl DetectorSettings {
     /// The plain, un-named default: `./model` with detector defaults.
     pub fn default_dir() -> Self {
-        Self { dir: PathBuf::from("./model"), labels: None, threshold: None, model_name: None }
+        Self {
+            dir: PathBuf::from("./model"),
+            labels: None,
+            threshold: None,
+            model_name: None,
+        }
     }
 
     /// Resolve settings from CLI values (which override environment variables).
@@ -149,7 +154,10 @@ impl DetectorSettings {
                 .or_else(|| env_nonempty("PORTCULLIS_MODELS").map(PathBuf::from))
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_REGISTRY_FILE));
             let registry = ModelRegistry::load(&path).with_context(|| {
-                format!("model '{name}' was requested, but no registry was readable at {}", path.display())
+                format!(
+                    "model '{name}' was requested, but no registry was readable at {}",
+                    path.display()
+                )
             })?;
             let (name, entry) = registry.resolve(Some(&name))?;
             return Ok(Self {
@@ -173,7 +181,12 @@ impl DetectorSettings {
             .or_else(|| env_nonempty("PORTCULLIS_THRESHOLD").and_then(|v| v.parse::<f32>().ok()))
             .filter(|t| (0.0..=1.0).contains(t));
 
-        Ok(Self { dir, labels, threshold, model_name: None })
+        Ok(Self {
+            dir,
+            labels,
+            threshold,
+            model_name: None,
+        })
     }
 }
 
@@ -218,8 +231,11 @@ mod tests {
     fn falls_back_to_the_registry_default() {
         let (_d, path) = write_registry(REGISTRY);
         let s = DetectorSettings::resolve(
-            Some("__use_default__".into()).filter(|_| false), // force no explicit name
-            None, None, None, Some(path.clone()),
+            None, // force no explicit name
+            None,
+            None,
+            None,
+            Some(path.clone()),
         )
         .unwrap();
         // No named model and no PORTCULLIS_MODEL -> raw dir path, not the registry.
@@ -247,9 +263,10 @@ mod tests {
     fn naming_a_model_without_a_registry_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist.json");
-        let err = DetectorSettings::resolve(Some("general".into()), None, None, None, Some(missing))
-            .unwrap_err()
-            .to_string();
+        let err =
+            DetectorSettings::resolve(Some("general".into()), None, None, None, Some(missing))
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("no registry was readable"), "{err}");
     }
 

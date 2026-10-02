@@ -67,7 +67,12 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
-    pub fn new(gateway: Gateway, client: Client, upstream_url: String, upstream_key: String) -> Self {
+    pub fn new(
+        gateway: Gateway,
+        client: Client,
+        upstream_url: String,
+        upstream_key: String,
+    ) -> Self {
         Self {
             gateway: Arc::new(Mutex::new(gateway)),
             client,
@@ -265,10 +270,16 @@ fn collect_content_texts(content: &mut Value, out: &mut Vec<String>) {
 }
 
 fn collect_tool_calls_texts(tool_calls: &mut Value, out: &mut Vec<String>) {
-    let Value::Array(calls) = tool_calls else { return };
+    let Value::Array(calls) = tool_calls else {
+        return;
+    };
     for call in calls {
-        let Value::Object(call_map) = call else { continue };
-        let Some(Value::Object(func_map)) = call_map.get_mut("function") else { continue };
+        let Value::Object(call_map) = call else {
+            continue;
+        };
+        let Some(Value::Object(func_map)) = call_map.get_mut("function") else {
+            continue;
+        };
         if let Some(Value::String(args)) = func_map.get_mut("arguments") {
             out.push(std::mem::take(args));
         }
@@ -309,10 +320,16 @@ fn replace_content_texts(content: &mut Value, redacted: &[String], idx: &mut usi
 }
 
 fn replace_tool_calls_texts(tool_calls: &mut Value, redacted: &[String], idx: &mut usize) {
-    let Value::Array(calls) = tool_calls else { return };
+    let Value::Array(calls) = tool_calls else {
+        return;
+    };
     for call in calls {
-        let Value::Object(call_map) = call else { continue };
-        let Some(Value::Object(func_map)) = call_map.get_mut("function") else { continue };
+        let Value::Object(call_map) = call else {
+            continue;
+        };
+        let Some(Value::Object(func_map)) = call_map.get_mut("function") else {
+            continue;
+        };
         if let Some(Value::String(_)) = func_map.get_mut("arguments") {
             func_map["arguments"] = Value::String(redacted[*idx].clone());
             *idx += 1;
@@ -523,10 +540,10 @@ async fn handle(
     headers: HeaderMap,
     body: Value,
 ) -> Result<Response, (StatusCode, String)> {
-    let messages = body
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .ok_or((StatusCode::BAD_REQUEST, "missing or invalid messages".to_string()))?;
+    let messages = body.get("messages").and_then(|m| m.as_array()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "missing or invalid messages".to_string(),
+    ))?;
 
     // Collect every redactable string from the original messages while
     // preserving all other fields.
@@ -818,10 +835,7 @@ async fn stream_response(
                         return Ok(Some((Bytes::from(tail), (buf, carry, stream, gw))));
                     }
                     Err(e) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e,
-                        ));
+                        return Err(std::io::Error::other(e));
                     }
                 }
             }
@@ -966,11 +980,7 @@ async fn process_sse_event(
 /// Apply `Gateway::rehydrate` to every text-bearing delta field in a streaming
 /// chunk: `choices[].delta.content`, `choices[].delta.reasoning_content`, and
 /// `choices[].delta.tool_calls[].function.arguments`.
-async fn rehydrate_sse_delta(
-    value: &mut Value,
-    carry: &mut StreamCarry,
-    gw: &Arc<Mutex<Gateway>>,
-) {
+async fn rehydrate_sse_delta(value: &mut Value, carry: &mut StreamCarry, gw: &Arc<Mutex<Gateway>>) {
     let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) else {
         return;
     };
@@ -1017,9 +1027,13 @@ fn rehydrate_response_message(msg: &mut Value, gw: &Gateway) {
 }
 
 fn rehydrate_tool_calls(tool_calls: &mut Value, pending: &mut String, gw: &Gateway) {
-    let Some(calls) = tool_calls.as_array_mut() else { return };
+    let Some(calls) = tool_calls.as_array_mut() else {
+        return;
+    };
     for call in calls.iter_mut() {
-        let Some(func) = call.get_mut("function") else { continue };
+        let Some(func) = call.get_mut("function") else {
+            continue;
+        };
         if let Some(Value::String(args)) = func.get_mut("arguments") {
             let rehydrated = rehydrate_with_carry(args, pending, gw);
             *args = rehydrated;
@@ -1069,7 +1083,8 @@ async fn anthropic_stream_response(
                         let mut tail = if buf.is_empty() {
                             String::new()
                         } else {
-                            let processed = process_anthropic_sse_event(&buf, &mut carry, &gw).await;
+                            let processed =
+                                process_anthropic_sse_event(&buf, &mut carry, &gw).await;
                             buf.clear();
                             processed
                         };
@@ -1080,10 +1095,7 @@ async fn anthropic_stream_response(
                         return Ok(Some((Bytes::from(tail), (buf, carry, stream, gw))));
                     }
                     Err(e) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e,
-                        ));
+                        return Err(std::io::Error::other(e));
                     }
                 }
             }
@@ -1115,7 +1127,10 @@ async fn process_anthropic_sse_event(
     let is_message_stop = event.lines().any(|line| {
         line.strip_prefix("data: ")
             .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-            .and_then(|v| v.get("type").and_then(|t| t.as_str().map(|s| s == "message_stop")))
+            .and_then(|v| {
+                v.get("type")
+                    .and_then(|t| t.as_str().map(|s| s == "message_stop"))
+            })
             .unwrap_or(false)
     });
     if is_message_stop {
@@ -1228,10 +1243,9 @@ fn default_scope() -> String {
 
 /// Resolve the effective store path for persistence.
 fn store_path(state: &ProxyState) -> String {
-    state
-        .store_path
-        .clone()
-        .unwrap_or_else(|| std::env::var("PORTCULLIS_STORE").unwrap_or_else(|_| "store.json".into()))
+    state.store_path.clone().unwrap_or_else(|| {
+        std::env::var("PORTCULLIS_STORE").unwrap_or_else(|_| "store.json".into())
+    })
 }
 
 /// Constant-time equality check for bearer tokens.
@@ -1256,14 +1270,24 @@ fn require_admin(state: &ProxyState, headers: &HeaderMap) -> Result<(), (StatusC
         Some(t) if !t.is_empty() => t.to_string(),
         _ => match std::env::var("PORTCULLIS_ADMIN_TOKEN") {
             Ok(t) if !t.is_empty() => t,
-            _ => return Err((StatusCode::SERVICE_UNAVAILABLE, "admin token not configured".into())),
+            _ => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "admin token not configured".into(),
+                ))
+            }
         },
     };
 
     let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
     let provided = match header {
         Some(h) if h.starts_with("Bearer ") => &h["Bearer ".len()..],
-        _ => return Err((StatusCode::UNAUTHORIZED, "missing or malformed bearer token".into())),
+        _ => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "missing or malformed bearer token".into(),
+            ))
+        }
     };
 
     if !constant_time_eq(provided, &token) {
@@ -1378,8 +1402,8 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
         .unwrap_or_else(|_| "https://api.anthropic.com/v1/messages".into());
     let anthropic_upstream_url = normalize_messages_url(&anthropic_upstream_url);
     let anthropic_upstream_key = std::env::var("PORTCULLIS_ANTHROPIC_KEY").unwrap_or_default();
-    let anthropic_version = std::env::var("PORTCULLIS_ANTHROPIC_VERSION")
-        .unwrap_or_else(|_| "2023-06-01".into());
+    let anthropic_version =
+        std::env::var("PORTCULLIS_ANTHROPIC_VERSION").unwrap_or_else(|_| "2023-06-01".into());
 
     // Timeouts — a hung provider must not hang the client forever.
     //  * connect_timeout caps connection establishment.
@@ -1404,10 +1428,9 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
 
     // Static upstream headers, for providers that require one on every call.
     // A malformed value fails startup rather than silently dropping the header.
-    let extra_upstream_headers = parse_extra_headers(
-        &std::env::var("PORTCULLIS_UPSTREAM_HEADERS").unwrap_or_default(),
-    )
-    .map_err(|e| anyhow::anyhow!(e))?;
+    let extra_upstream_headers =
+        parse_extra_headers(&std::env::var("PORTCULLIS_UPSTREAM_HEADERS").unwrap_or_default())
+            .map_err(|e| anyhow::anyhow!(e))?;
 
     let client = Client::builder()
         .use_rustls_tls()

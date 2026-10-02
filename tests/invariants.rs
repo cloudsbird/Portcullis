@@ -18,7 +18,11 @@ fn outbound_never_contains_raw_pii() {
     let mut gw = gw_with(&[("Cartalian", "ORG")]);
     let segs = vec!["Email daniel.pratt@northwind-logistics.com about Cartalian.".to_string()];
     let out = gw.process(&segs);
-    assert!(!out[0].contains("daniel.pratt@northwind-logistics.com"), "{}", out[0]);
+    assert!(
+        !out[0].contains("daniel.pratt@northwind-logistics.com"),
+        "{}",
+        out[0]
+    );
     assert!(!out[0].contains("Cartalian"), "{}", out[0]);
     assert!(gw.assert_clean(&out).is_ok());
 }
@@ -30,7 +34,11 @@ fn repeat_segment_reemits_redacted_not_raw() {
     let seg = "Cartalian is our client.".to_string();
     let _ = gw.process(std::slice::from_ref(&seg)); // turn 1: scanned
     let out = gw.process(std::slice::from_ref(&seg)); // turn 2: cache hit
-    assert!(!out[0].contains("Cartalian"), "cache echoed raw: {}", out[0]);
+    assert!(
+        !out[0].contains("Cartalian"),
+        "cache echoed raw: {}",
+        out[0]
+    );
 }
 
 /// INVARIANT 3: teaching mid-session invalidates the cache — no stale-redaction leak.
@@ -40,7 +48,10 @@ fn teach_invalidates_cache() {
     let seg = "Email daniel.pratt@northwind-logistics.com about Project Loki.".to_string();
 
     let t1 = gw.process(std::slice::from_ref(&seg));
-    assert!(t1[0].contains("Project Loki"), "not taught yet, should be visible");
+    assert!(
+        t1[0].contains("Project Loki"),
+        "not taught yet, should be visible"
+    );
 
     gw.teach("Project Loki", "ORG", "global"); // policy change
 
@@ -74,8 +85,15 @@ fn allow_list_wins() {
     });
     let mut gw = Gateway::new(s);
     let out = gw.process(&["Adit pinged us.".to_string()]);
-    assert!(out[0].contains("Adit"), "allow-listed term was redacted: {}", out[0]);
-    assert!(gw.assert_clean(&out).is_ok(), "assertion flagged an allowed term");
+    assert!(
+        out[0].contains("Adit"),
+        "allow-listed term was redacted: {}",
+        out[0]
+    );
+    assert!(
+        gw.assert_clean(&out).is_ok(),
+        "assertion flagged an allowed term"
+    );
 }
 
 /// A model reply that echoes a placeholder is restored locally.

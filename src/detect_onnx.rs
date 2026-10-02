@@ -118,8 +118,12 @@ impl OnnxDetector {
 
         let encoder = load_session(dir, onnx_files.get("encoder").context("missing encoder")?)?;
         let span_rep = load_session(dir, onnx_files.get("span_rep").context("missing span_rep")?)?;
-        let count_embed =
-            load_session(dir, onnx_files.get("count_embed").context("missing count_embed")?)?;
+        let count_embed = load_session(
+            dir,
+            onnx_files
+                .get("count_embed")
+                .context("missing count_embed")?,
+        )?;
 
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
@@ -193,11 +197,17 @@ impl OnnxDetector {
             return Vec::new();
         }
 
-        let (input_ids, attention_mask, e_positions, word_offsets, text_start_idx, first_token_positions) =
-            match self.build_ner_input(text) {
-                Ok(x) => x,
-                Err(_) => return Vec::new(),
-            };
+        let (
+            input_ids,
+            attention_mask,
+            e_positions,
+            word_offsets,
+            text_start_idx,
+            first_token_positions,
+        ) = match self.build_ner_input(text) {
+            Ok(x) => x,
+            Err(_) => return Vec::new(),
+        };
 
         let num_words = word_offsets.len();
         if num_words == 0 {
@@ -256,10 +266,8 @@ impl OnnxDetector {
         };
 
         let mut entities: Vec<RawEntity> = Vec::new();
-        for (span_idx, (&start_word, &end_word)) in word_span_start
-            .iter()
-            .zip(word_span_end.iter())
-            .enumerate()
+        for (span_idx, (&start_word, &end_word)) in
+            word_span_start.iter().zip(word_span_end.iter()).enumerate()
         {
             for (label_idx, label) in self.labels.iter().enumerate() {
                 let score = scores[[span_idx, label_idx]];
@@ -300,7 +308,8 @@ impl OnnxDetector {
         usize,
         Vec<usize>,
     )> {
-        let (mut tokens, e_positions) = self.build_schema_prefix(NER_TASK_NAME, &self.labels, TOKEN_E)?;
+        let (mut tokens, e_positions) =
+            self.build_schema_prefix(NER_TASK_NAME, &self.labels, TOKEN_E)?;
         let text_start_idx = tokens.len();
 
         let lower = text.to_lowercase();
@@ -325,7 +334,14 @@ impl OnnxDetector {
         let input_ids = Array2::from_shape_vec((1, seq_len), tokens)?;
         let attention_mask = Array2::<i64>::ones((1, seq_len));
 
-        Ok((input_ids, attention_mask, e_positions, word_offsets, text_start_idx, first_token_positions))
+        Ok((
+            input_ids,
+            attention_mask,
+            e_positions,
+            word_offsets,
+            text_start_idx,
+            first_token_positions,
+        ))
     }
 
     /// Build `( [P] task ( [E] label1 [E] label2 ... ) ) [SEP_TEXT]`.
@@ -335,7 +351,10 @@ impl OnnxDetector {
         labels: &[String],
         label_token: &str,
     ) -> Result<(Vec<i64>, Vec<usize>)> {
-        let p_id = self.special_tokens.get(TOKEN_P).context("missing [P] token")?;
+        let p_id = self
+            .special_tokens
+            .get(TOKEN_P)
+            .context("missing [P] token")?;
         let label_token_id = self
             .special_tokens
             .get(label_token)
@@ -346,20 +365,44 @@ impl OnnxDetector {
             .context("missing [SEP_TEXT] token")?;
 
         let mut tokens: Vec<i64> = Vec::new();
-        tokens.extend(encode_token(&self.tokenizer, SCHEMA_OPEN)?.iter().map(|&id| id as i64));
+        tokens.extend(
+            encode_token(&self.tokenizer, SCHEMA_OPEN)?
+                .iter()
+                .map(|&id| id as i64),
+        );
         tokens.push(*p_id as i64);
-        tokens.extend(encode_token(&self.tokenizer, task_name)?.iter().map(|&id| id as i64));
-        tokens.extend(encode_token(&self.tokenizer, SCHEMA_OPEN)?.iter().map(|&id| id as i64));
+        tokens.extend(
+            encode_token(&self.tokenizer, task_name)?
+                .iter()
+                .map(|&id| id as i64),
+        );
+        tokens.extend(
+            encode_token(&self.tokenizer, SCHEMA_OPEN)?
+                .iter()
+                .map(|&id| id as i64),
+        );
 
         let mut label_positions = Vec::with_capacity(labels.len());
         for label in labels {
             label_positions.push(tokens.len());
             tokens.push(*label_token_id as i64);
-            tokens.extend(encode_token(&self.tokenizer, label)?.iter().map(|&id| id as i64));
+            tokens.extend(
+                encode_token(&self.tokenizer, label)?
+                    .iter()
+                    .map(|&id| id as i64),
+            );
         }
 
-        tokens.extend(encode_token(&self.tokenizer, SCHEMA_CLOSE)?.iter().map(|&id| id as i64));
-        tokens.extend(encode_token(&self.tokenizer, SCHEMA_CLOSE)?.iter().map(|&id| id as i64));
+        tokens.extend(
+            encode_token(&self.tokenizer, SCHEMA_CLOSE)?
+                .iter()
+                .map(|&id| id as i64),
+        );
+        tokens.extend(
+            encode_token(&self.tokenizer, SCHEMA_CLOSE)?
+                .iter()
+                .map(|&id| id as i64),
+        );
         tokens.push(*sep_text_id as i64);
 
         Ok((tokens, label_positions))
@@ -407,7 +450,11 @@ struct RawEntity {
 }
 
 fn deduplicate_entities(mut entities: Vec<RawEntity>) -> Vec<RawEntity> {
-    entities.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    entities.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut kept: Vec<RawEntity> = Vec::new();
     for e in entities {
         let overlaps = kept

@@ -121,10 +121,18 @@ async fn anthropic_non_streaming_redacts_system_and_content() {
     );
     let json: Value = resp.json().await.unwrap();
     let content = json["content"][0]["text"].as_str().expect("text content");
-    assert!(content.contains("Cartalian"), "response was not rehydrated: {}", content);
+    assert!(
+        content.contains("Cartalian"),
+        "response was not rehydrated: {}",
+        content
+    );
 
     let recorded = bodies.lock().await;
-    assert_eq!(recorded.len(), 1, "upstream should have received exactly one request");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "upstream should have received exactly one request"
+    );
     assert!(
         !recorded[0].contains("Cartalian"),
         "upstream body contained raw PII: {}",
@@ -196,7 +204,9 @@ async fn anthropic_redacts_tool_use_and_tool_result() {
     let recorded = bodies.lock().await;
     assert_eq!(recorded.len(), 1);
     let forwarded: Value = serde_json::from_str(&recorded[0]).unwrap();
-    let content = forwarded["messages"][0]["content"].as_array().expect("content array");
+    let content = forwarded["messages"][0]["content"]
+        .as_array()
+        .expect("content array");
     assert_eq!(content.len(), 2);
 
     let tool_result_text = content[0]["content"].as_str().unwrap();
@@ -212,7 +222,10 @@ async fn anthropic_redacts_tool_use_and_tool_result() {
         "tool_use input client leaked raw PII"
     );
     assert!(
-        !input["contact"]["email"].as_str().unwrap().contains("daniel@example.com"),
+        !input["contact"]["email"]
+            .as_str()
+            .unwrap()
+            .contains("daniel@example.com"),
         "tool_use input email leaked raw PII"
     );
 }
@@ -357,7 +370,9 @@ async fn anthropic_fails_closed_and_does_not_forward() {
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let upstream = MockUpstream {
         bodies: bodies.clone(),
-        chunks: vec![Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")],
+        chunks: vec![Bytes::from(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )],
     };
     let upstream_url = spawn_server(mock_anthropic_app(upstream)).await;
     let state = anthropic_proxy_state(gw, upstream_url);

@@ -78,7 +78,11 @@ impl Store {
 
     /// Teach a term. Idempotent by (case-insensitive) term.
     pub fn teach(&mut self, term: &str, label: &str, scope: &str) {
-        if let Some(e) = self.deny.iter_mut().find(|e| e.term.eq_ignore_ascii_case(term)) {
+        if let Some(e) = self
+            .deny
+            .iter_mut()
+            .find(|e| e.term.eq_ignore_ascii_case(term))
+        {
             e.label = label.to_string();
             return;
         }

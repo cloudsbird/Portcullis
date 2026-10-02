@@ -44,8 +44,7 @@ async fn mock_json_handler(
 
 async fn mock_sse_handler(State(state): State<MockUpstream>, Json(body): Json<Value>) -> Response {
     state.bodies.lock().await.push(body.to_string());
-    let items: Vec<Result<Bytes, std::io::Error>> =
-        state.chunks.into_iter().map(Ok).collect();
+    let items: Vec<Result<Bytes, std::io::Error>> = state.chunks.into_iter().map(Ok).collect();
     let stream = stream::iter(items);
     Response::builder()
         .status(axum::http::StatusCode::OK)
@@ -103,12 +102,20 @@ async fn non_streaming_request_behaves_as_before() {
         .await
         .unwrap();
 
-    assert!(resp.status().is_success(), "proxy returned error: {:?}", resp.text().await);
+    assert!(
+        resp.status().is_success(),
+        "proxy returned error: {:?}",
+        resp.text().await
+    );
     let json: Value = resp.json().await.unwrap();
     assert_eq!(json["choices"][0]["message"]["content"], "Understood.");
 
     let recorded = bodies.lock().await;
-    assert_eq!(recorded.len(), 1, "upstream should have received exactly one request");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "upstream should have received exactly one request"
+    );
     assert!(
         !recorded[0].contains("Cartalian"),
         "upstream body contained raw PII: {}",
@@ -147,7 +154,11 @@ async fn streaming_request_rehydrates_and_does_not_forward_pii() {
         .await
         .unwrap();
 
-    assert!(resp.status().is_success(), "proxy returned error: {:?}", resp.text().await);
+    assert!(
+        resp.status().is_success(),
+        "proxy returned error: {:?}",
+        resp.text().await
+    );
     let ct = resp
         .headers()
         .get("content-type")
@@ -163,7 +174,11 @@ async fn streaming_request_rehydrates_and_does_not_forward_pii() {
     let text = resp.text().await.unwrap();
 
     let recorded = bodies.lock().await;
-    assert_eq!(recorded.len(), 1, "upstream should have received exactly one request");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "upstream should have received exactly one request"
+    );
     assert!(
         !recorded[0].contains("Cartalian"),
         "upstream body leaked raw PII: {}",
@@ -193,7 +208,9 @@ async fn streaming_request_handles_split_placeholder() {
     let upstream = MockUpstream {
         bodies: bodies.clone(),
         chunks: vec![
-            Bytes::from("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"He works at <<EMAI"),
+            Bytes::from(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"He works at <<EMAI",
+            ),
             Bytes::from("L_1>>\"},\"finish_reason\":null}]}\n\n"),
             Bytes::from("data: [DONE]\n\n"),
         ],
@@ -214,7 +231,11 @@ async fn streaming_request_handles_split_placeholder() {
         .await
         .unwrap();
 
-    assert!(resp.status().is_success(), "proxy returned error: {:?}", resp.text().await);
+    assert!(
+        resp.status().is_success(),
+        "proxy returned error: {:?}",
+        resp.text().await
+    );
     let text = resp.text().await.unwrap();
 
     assert!(
@@ -315,7 +336,11 @@ async fn streaming_request_rehydrates_tool_call_arguments() {
         .await
         .unwrap();
 
-    assert!(resp.status().is_success(), "proxy returned error: {:?}", resp.text().await);
+    assert!(
+        resp.status().is_success(),
+        "proxy returned error: {:?}",
+        resp.text().await
+    );
     let text = resp.text().await.unwrap();
 
     let recorded = bodies.lock().await;
@@ -369,7 +394,11 @@ async fn streaming_request_preserves_done() {
         .await
         .unwrap();
 
-    assert!(resp.status().is_success(), "proxy returned error: {:?}", resp.text().await);
+    assert!(
+        resp.status().is_success(),
+        "proxy returned error: {:?}",
+        resp.text().await
+    );
     let text = resp.text().await.unwrap();
     assert!(
         text.contains("data: [DONE]"),
@@ -419,7 +448,11 @@ async fn streaming_request_handles_placeholder_split_across_events() {
         .await
         .unwrap();
 
-    assert!(resp.status().is_success(), "proxy returned error: {:?}", resp.text().await);
+    assert!(
+        resp.status().is_success(),
+        "proxy returned error: {:?}",
+        resp.text().await
+    );
     let text = resp.text().await.unwrap();
 
     assert!(

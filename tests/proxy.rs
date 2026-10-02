@@ -59,7 +59,10 @@ async fn proxy_never_forwards_raw_pii() {
     let gw = Gateway::new(store);
 
     let bodies = Arc::new(Mutex::new(Vec::new()));
-    let upstream_url = spawn_server(mock_app(MockUpstream { bodies: bodies.clone() })).await;
+    let upstream_url = spawn_server(mock_app(MockUpstream {
+        bodies: bodies.clone(),
+    }))
+    .await;
     let client = Client::new();
     let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
     let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
@@ -74,10 +77,18 @@ async fn proxy_never_forwards_raw_pii() {
         .await
         .unwrap();
 
-    assert!(resp.status().is_success(), "proxy returned error: {:?}", resp.text().await);
+    assert!(
+        resp.status().is_success(),
+        "proxy returned error: {:?}",
+        resp.text().await
+    );
 
     let recorded = bodies.lock().await;
-    assert_eq!(recorded.len(), 1, "upstream should have received exactly one request");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "upstream should have received exactly one request"
+    );
     assert!(
         !recorded[0].contains("Cartalian"),
         "upstream body contained raw PII: {}",
@@ -97,7 +108,10 @@ async fn proxy_fails_closed_and_does_not_forward() {
     let gw = Gateway::new(store);
 
     let bodies = Arc::new(Mutex::new(Vec::new()));
-    let upstream_url = spawn_server(mock_app(MockUpstream { bodies: bodies.clone() })).await;
+    let upstream_url = spawn_server(mock_app(MockUpstream {
+        bodies: bodies.clone(),
+    }))
+    .await;
     let client = Client::new();
     let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
     let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
@@ -134,7 +148,10 @@ async fn proxy_rehydrates_assistant_reply() {
     let gw = Gateway::new(store);
 
     let bodies = Arc::new(Mutex::new(Vec::new()));
-    let upstream_url = spawn_server(mock_app(MockUpstream { bodies: bodies.clone() })).await;
+    let upstream_url = spawn_server(mock_app(MockUpstream {
+        bodies: bodies.clone(),
+    }))
+    .await;
     let client = Client::new();
     let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
     let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
@@ -149,7 +166,11 @@ async fn proxy_rehydrates_assistant_reply() {
         .await
         .unwrap();
 
-    assert!(resp.status().is_success(), "proxy returned error: {:?}", resp.text().await);
+    assert!(
+        resp.status().is_success(),
+        "proxy returned error: {:?}",
+        resp.text().await
+    );
 
     // The mock upstream replied with plain "Understood.", so rehydration is a no-op.
     let json: Value = resp.json().await.unwrap();
@@ -168,7 +189,10 @@ async fn proxy_redacts_tool_call_arguments_and_preserves_tool_calls() {
     let gw = Gateway::new(store);
 
     let bodies = Arc::new(Mutex::new(Vec::new()));
-    let upstream_url = spawn_server(mock_app(MockUpstream { bodies: bodies.clone() })).await;
+    let upstream_url = spawn_server(mock_app(MockUpstream {
+        bodies: bodies.clone(),
+    }))
+    .await;
     let client = Client::new();
     let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
     let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
@@ -203,7 +227,11 @@ async fn proxy_redacts_tool_call_arguments_and_preserves_tool_calls() {
     );
 
     let recorded = bodies.lock().await;
-    assert_eq!(recorded.len(), 1, "upstream should have received exactly one request");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "upstream should have received exactly one request"
+    );
     let forwarded: Value = serde_json::from_str(&recorded[0]).unwrap();
     let tool_calls = forwarded["messages"][0]["tool_calls"]
         .as_array()
@@ -232,7 +260,10 @@ async fn proxy_redacts_multimodal_content_parts() {
     let gw = Gateway::new(store);
 
     let bodies = Arc::new(Mutex::new(Vec::new()));
-    let upstream_url = spawn_server(mock_app(MockUpstream { bodies: bodies.clone() })).await;
+    let upstream_url = spawn_server(mock_app(MockUpstream {
+        bodies: bodies.clone(),
+    }))
+    .await;
     let client = Client::new();
     let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
     let proxy_url = spawn_server(portcullis::proxy::app(state)).await;

@@ -45,7 +45,13 @@ impl Detector for DictionaryDetector<'_> {
             while let Some(idx) = lower[from..].find(&needle) {
                 let start = from + idx;
                 let end = start + needle.len();
-                spans.push(Span { start, end, label: label.clone(), source: "dictionary", score: 0.0 });
+                spans.push(Span {
+                    start,
+                    end,
+                    label: label.clone(),
+                    source: "dictionary",
+                    score: 0.0,
+                });
                 from = end.max(start + 1);
             }
         }
@@ -67,7 +73,10 @@ impl RegexDetector {
             (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "IP"),
         ];
         Self {
-            patterns: defs.iter().map(|(p, l)| (Regex::new(p).unwrap(), *l)).collect(),
+            patterns: defs
+                .iter()
+                .map(|(p, l)| (Regex::new(p).unwrap(), *l))
+                .collect(),
         }
     }
 }

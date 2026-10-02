@@ -77,7 +77,10 @@ async fn teach_over_http_invalidates_delta_cache() {
 
     let gw = Gateway::new(Store::default());
     let bodies = Arc::new(Mutex::new(Vec::new()));
-    let upstream_url = spawn_server(mock_app(MockUpstream { bodies: bodies.clone() })).await;
+    let upstream_url = spawn_server(mock_app(MockUpstream {
+        bodies: bodies.clone(),
+    }))
+    .await;
     let client = Client::new();
 
     let mut state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
@@ -98,11 +101,19 @@ async fn teach_over_http_invalidates_delta_cache() {
         .send()
         .await
         .unwrap();
-    assert!(resp1.status().is_success(), "first chat failed: {:?}", resp1.text().await);
+    assert!(
+        resp1.status().is_success(),
+        "first chat failed: {:?}",
+        resp1.text().await
+    );
 
     {
         let recorded = bodies.lock().await;
-        assert_eq!(recorded.len(), 1, "upstream should have received the first request");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "upstream should have received the first request"
+        );
         assert!(
             recorded[0].contains(term),
             "first request should contain the raw, untaught term: {}",
@@ -132,11 +143,19 @@ async fn teach_over_http_invalidates_delta_cache() {
         .send()
         .await
         .unwrap();
-    assert!(resp2.status().is_success(), "second chat failed: {:?}", resp2.text().await);
+    assert!(
+        resp2.status().is_success(),
+        "second chat failed: {:?}",
+        resp2.text().await
+    );
 
     {
         let recorded = bodies.lock().await;
-        assert_eq!(recorded.len(), 2, "upstream should have received the second request");
+        assert_eq!(
+            recorded.len(),
+            2,
+            "upstream should have received the second request"
+        );
         assert!(
             !recorded[1].contains(term),
             "second request leaked the now-taught term: {}",
@@ -152,7 +171,10 @@ async fn teach_over_http_invalidates_delta_cache() {
 async fn teach_requires_bearer_token() {
     let gw = Gateway::new(Store::default());
     let bodies = Arc::new(Mutex::new(Vec::new()));
-    let upstream_url = spawn_server(mock_app(MockUpstream { bodies: bodies.clone() })).await;
+    let upstream_url = spawn_server(mock_app(MockUpstream {
+        bodies: bodies.clone(),
+    }))
+    .await;
     let client = Client::new();
 
     let mut state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
@@ -187,7 +209,10 @@ async fn suggestions_returns_untaught_detected_term() {
     let email = "suggestions-test@example.com";
     let gw = Gateway::new(Store::default());
     let bodies = Arc::new(Mutex::new(Vec::new()));
-    let upstream_url = spawn_server(mock_app(MockUpstream { bodies: bodies.clone() })).await;
+    let upstream_url = spawn_server(mock_app(MockUpstream {
+        bodies: bodies.clone(),
+    }))
+    .await;
     let client = Client::new();
 
     let mut state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
@@ -245,7 +270,10 @@ async fn unteach_removes_term() {
     store.teach("Aerolith", "ORG", "global");
     let gw = Gateway::new(store);
     let bodies = Arc::new(Mutex::new(Vec::new()));
-    let upstream_url = spawn_server(mock_app(MockUpstream { bodies: bodies.clone() })).await;
+    let upstream_url = spawn_server(mock_app(MockUpstream {
+        bodies: bodies.clone(),
+    }))
+    .await;
     let client = Client::new();
 
     let mut state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());

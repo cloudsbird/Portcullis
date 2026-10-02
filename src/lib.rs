@@ -22,7 +22,7 @@ pub mod proxy;
 pub mod store;
 pub mod vault;
 
-pub use pipeline::Gateway;
 pub use model::DetectorSettings;
+pub use pipeline::Gateway;
 pub use store::{Entry, Store};
 pub use vault::Vault;

@@ -118,7 +118,11 @@ async fn stalled_upstream_times_out() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 502, "a stalled upstream should surface as 502");
+    assert_eq!(
+        resp.status(),
+        502,
+        "a stalled upstream should surface as 502"
+    );
     let text = resp.text().await.unwrap();
     assert!(
         text.contains("timeout"),

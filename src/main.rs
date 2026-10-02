@@ -7,7 +7,11 @@ use portcullis::model::{DetectorSettings, ModelRegistry, DEFAULT_REGISTRY_FILE};
 use portcullis::{Gateway, Store};
 
 #[derive(Parser)]
-#[command(name = "portcullis", about = "Local-first, teachable PII gateway", version)]
+#[command(
+    name = "portcullis",
+    about = "Local-first, teachable PII gateway",
+    version
+)]
 struct Cli {
     /// Path to the entity store (the crown jewels). Keep it out of the repo.
     #[arg(long, global = true, default_value = "store.json")]
