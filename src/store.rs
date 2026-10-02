@@ -40,7 +40,7 @@ pub struct HiddenForm {
 /// (see docs/TEACHING.md, "What teaching does NOT do"). This file is the crown
 /// jewels: a map of everything you consider private. It must never leave the
 /// machine and must never be committed (see `.gitignore`).
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Store {
     #[serde(default)]
     pub deny: Vec<Entry>,

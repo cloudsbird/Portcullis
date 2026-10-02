@@ -175,6 +175,14 @@ impl Gateway {
         dict
     }
 
+    /// Replace the whole store (e.g. with a fresh read from disk). A policy change, so
+    /// the delta cache is cleared (invariant 3).
+    pub fn replace_store(&mut self, store: Store) {
+        self.store = store;
+        self.cache.clear();
+        self.metrics.set_store_terms(self.store.deny.len());
+    }
+
     pub fn vault(&self) -> &Vault {
         &self.vault
     }

@@ -73,6 +73,9 @@ pub struct ProxyState {
     pub metrics: Arc<crate::Metrics>,
     /// Bearer token required by `/metrics`. `None`: open, like `/healthz`.
     pub metrics_token: Option<String>,
+    /// Serializes teach/unteach so their read-modify-write of the store file cannot
+    /// interleave. Held across disk I/O, which is why it is not the gateway lock.
+    pub store_write_lock: Arc<Mutex<()>>,
 }
 
 impl ProxyState {
@@ -100,6 +103,7 @@ impl ProxyState {
             scope_tokens: Vec::new(),
             metrics,
             metrics_token: None,
+            store_write_lock: Arc::new(Mutex::new(())),
         }
     }
 }
