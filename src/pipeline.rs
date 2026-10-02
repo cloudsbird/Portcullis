@@ -1,10 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use sha2::{Digest, Sha256};
 
 use crate::detect::{merge, Detector, DictionaryDetector, RegexDetector};
 use crate::store::Store;
 use crate::vault::Vault;
+
+/// Maximum number of recent auto-suggest candidates to retain.
+const SUGGESTION_LIMIT: usize = 200;
 
 /// The gateway: the learned store, the vault, and the per-session delta cache.
 pub struct Gateway {
@@ -16,6 +19,8 @@ pub struct Gateway {
     /// Optional additional detector (e.g. the ONNX GLiNER2 model). Runs *after* the
     /// deterministic layers, so it can only add recall — never override the guarantee.
     extra: Option<Box<dyn Detector>>,
+    /// Recent spans redacted by a non-dictionary detector (regex, ONNX, …).
+    suggestions: VecDeque<String>,
 }
 
 impl Gateway {
@@ -26,6 +31,7 @@ impl Gateway {
             cache: HashMap::new(),
             regexes: RegexDetector::new(),
             extra: None,
+            suggestions: VecDeque::new(),
         }
     }
 
@@ -55,6 +61,29 @@ impl Gateway {
 
     pub fn vault(&self) -> &Vault {
         &self.vault
+    }
+
+    /// Return the recent auto-suggest candidates.
+    pub fn suggestions(&self) -> Vec<String> {
+        self.suggestions.iter().cloned().collect()
+    }
+
+    fn is_known(&self, term: &str) -> bool {
+        if self.store.is_allowed(term) {
+            return true;
+        }
+        let lower = term.to_lowercase();
+        self.store
+            .hidden_forms()
+            .iter()
+            .any(|(form, _)| form.to_lowercase() == lower)
+    }
+
+    fn push_suggestion(&mut self, term: &str) {
+        if self.suggestions.len() >= SUGGESTION_LIMIT {
+            self.suggestions.pop_front();
+        }
+        self.suggestions.push_back(term.to_string());
     }
 
     /// Teach a term. **Invalidates the delta cache** (invariant 3): a cached redaction
@@ -94,7 +123,7 @@ impl Gateway {
         }
         let mut out = String::with_capacity(seg.len());
         let mut cursor = 0usize;
-        for s in spans {
+        for s in &spans {
             if s.start < cursor {
                 continue;
             }
@@ -105,6 +134,9 @@ impl Gateway {
             } else {
                 let ph = self.vault.placeholder_for(&s.label, real);
                 out.push_str(&ph);
+                if s.source != "dictionary" && !self.is_known(real) {
+                    self.push_suggestion(real);
+                }
             }
             cursor = s.end;
         }

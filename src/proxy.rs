@@ -6,12 +6,13 @@
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,6 +28,12 @@ pub struct ProxyState {
     pub client: Client,
     pub upstream_url: String,
     pub upstream_key: String,
+    /// Persist path for the learned store. If `None`, endpoints fall back to
+    /// `PORTCULLIS_STORE` and then to `store.json`.
+    pub store_path: Option<String>,
+    /// Admin bearer token. If `None`, endpoints fall back to
+    /// `PORTCULLIS_ADMIN_TOKEN` and reject requests when it is unset.
+    pub admin_token: Option<String>,
 }
 
 impl ProxyState {
@@ -36,6 +43,8 @@ impl ProxyState {
             client,
             upstream_url,
             upstream_key,
+            store_path: None,
+            admin_token: None,
         }
     }
 }
@@ -219,9 +228,142 @@ async fn handle(state: ProxyState, body: Value) -> Result<Response, (StatusCode,
     Ok((status, Json(upstream_json)).into_response())
 }
 
+// ---------------------------------------------------------------------------
+// In-chat learning surface (M2)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct TeachRequest {
+    term: String,
+    label: String,
+    #[serde(default = "default_scope")]
+    scope: String,
+}
+
+#[derive(Deserialize)]
+struct UnteachRequest {
+    term: String,
+}
+
+fn default_scope() -> String {
+    "global".into()
+}
+
+/// Resolve the effective store path for persistence.
+fn store_path(state: &ProxyState) -> String {
+    state
+        .store_path
+        .clone()
+        .unwrap_or_else(|| std::env::var("PORTCULLIS_STORE").unwrap_or_else(|_| "store.json".into()))
+}
+
+/// Constant-time equality check for bearer tokens.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let max = a.len().max(b.len());
+    let mut diff = 0u8;
+    for i in 0..max {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0 && a.len() == b.len()
+}
+
+/// Enforce `Authorization: Bearer <PORTCULLIS_ADMIN_TOKEN>`.
+///
+/// Returns 503 if no token is configured, 401 on mismatch or missing header.
+fn require_admin(state: &ProxyState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    let token: String = match state.admin_token.as_deref() {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => match std::env::var("PORTCULLIS_ADMIN_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => return Err((StatusCode::SERVICE_UNAVAILABLE, "admin token not configured".into())),
+        },
+    };
+
+    let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+    let provided = match header {
+        Some(h) if h.starts_with("Bearer ") => &h["Bearer ".len()..],
+        _ => return Err((StatusCode::UNAUTHORIZED, "missing or malformed bearer token".into())),
+    };
+
+    if !constant_time_eq(provided, &token) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid bearer token".into()));
+    }
+    Ok(())
+}
+
+async fn teach_handler(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    Json(req): Json<TeachRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers) {
+        return e.into_response();
+    }
+
+    let path = store_path(&state);
+    let mut gw = state.gateway.lock().await;
+    gw.teach(&req.term, &req.label, &req.scope);
+    if let Err(e) = gw.store.save(&path) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    let total = gw.store.deny.len();
+    Json(json!({ "ok": true, "taught": req.term, "total": total })).into_response()
+}
+
+async fn unteach_handler(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    Json(req): Json<UnteachRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers) {
+        return e.into_response();
+    }
+
+    let path = store_path(&state);
+    let mut gw = state.gateway.lock().await;
+    let removed = gw.unteach(&req.term);
+    if let Err(e) = gw.store.save(&path) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    Json(json!({ "ok": true, "removed": removed })).into_response()
+}
+
+async fn terms_handler(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
+    if let Err(e) = require_admin(&state, &headers) {
+        return e.into_response();
+    }
+
+    let gw = state.gateway.lock().await;
+    let terms: Vec<Value> = gw
+        .store
+        .deny
+        .iter()
+        .map(|e| json!({"term": e.term, "label": e.label, "scope": e.scope}))
+        .collect();
+    Json(json!({ "terms": terms })).into_response()
+}
+
+async fn suggestions_handler(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
+    if let Err(e) = require_admin(&state, &headers) {
+        return e.into_response();
+    }
+
+    let gw = state.gateway.lock().await;
+    let suggestions = gw.suggestions();
+    Json(json!({ "suggestions": suggestions })).into_response()
+}
+
 pub fn app(state: ProxyState) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/teach", post(teach_handler))
+        .route("/unteach", post(unteach_handler))
+        .route("/terms", get(terms_handler))
+        .route("/suggestions", get(suggestions_handler))
         .with_state(state)
 }
 
@@ -233,12 +375,21 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
     let upstream_url = std::env::var("PORTCULLIS_UPSTREAM_URL")
         .map_err(|_| anyhow::anyhow!("PORTCULLIS_UPSTREAM_URL is not set"))?;
     let upstream_key = std::env::var("PORTCULLIS_UPSTREAM_KEY").unwrap_or_default();
+    let store_path = std::env::var("PORTCULLIS_STORE").unwrap_or_else(|_| "store.json".into());
+    let admin_token = std::env::var("PORTCULLIS_ADMIN_TOKEN").unwrap_or_default();
+    let admin_token = if admin_token.is_empty() {
+        None
+    } else {
+        Some(admin_token)
+    };
 
     let client = Client::builder()
         .use_rustls_tls()
         .build()?;
 
-    let state = ProxyState::new(gateway, client, upstream_url, upstream_key);
+    let mut state = ProxyState::new(gateway, client, upstream_url, upstream_key);
+    state.store_path = Some(store_path);
+    state.admin_token = admin_token;
     let addr: SocketAddr = bind.parse()?;
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app(state)).await?;
