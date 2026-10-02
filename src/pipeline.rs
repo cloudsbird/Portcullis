@@ -6,6 +6,18 @@ use crate::detect::{merge, Detector, DictionaryDetector, RegexDetector};
 use crate::store::Store;
 use crate::vault::Vault;
 
+/// Delta-cache size at which it is flushed, so a long-lived proxy cannot grow it
+/// without bound.
+const CACHE_LIMIT: usize = 20_000;
+
+/// A detected span, by offset only — never the text it covers.
+#[derive(Clone)]
+struct CachedSpan {
+    start: usize,
+    end: usize,
+    label: String,
+}
+
 /// Maximum number of recent auto-suggest candidates to retain.
 const SUGGESTION_LIMIT: usize = 200;
 
@@ -13,8 +25,8 @@ const SUGGESTION_LIMIT: usize = 200;
 pub struct Gateway {
     pub store: Store,
     vault: Vault,
-    /// `sha256(original segment) -> redacted segment`. Never stores raw originals.
-    cache: HashMap<String, String>,
+    /// `sha256(original segment) -> spans`. Stores offsets, never raw originals.
+    cache: HashMap<String, Vec<CachedSpan>>,
     regexes: RegexDetector,
     /// Optional additional detector (e.g. the ONNX GLiNER2 model). Runs *after* the
     /// deterministic layers, so it can only add recall — never override the guarantee.
@@ -150,62 +162,87 @@ impl Gateway {
         hex::encode(h.finalize())
     }
 
-    /// Redact one segment: deterministic dictionary first, then builtin patterns.
-    fn redact_segment(&mut self, dict: &DictionaryDetector, seg: &str) -> String {
+    /// Find what to redact in one segment: deterministic dictionary first, then
+    /// builtin patterns, then the optional ML detector. Returns offsets only —
+    /// never the matched text — so the result is safe to cache and can be applied
+    /// against any session's vault.
+    fn detect_spans(&mut self, dict: &DictionaryDetector, seg: &str) -> Vec<CachedSpan> {
         let mut spans = dict.detect(seg);
         spans.extend(self.regexes.detect(seg));
         if let Some(extra) = &self.extra {
             spans.extend(extra.detect(seg));
         }
-        let spans = merge(spans);
-        if spans.is_empty() {
-            return seg.to_string();
-        }
-        let mut out = String::with_capacity(seg.len());
-        let mut cursor = 0usize;
-        for s in &spans {
-            if s.start < cursor {
-                continue;
-            }
-            out.push_str(&seg[cursor..s.start]);
+        let mut kept = Vec::new();
+        for s in merge(spans) {
             let real = &seg[s.start..s.end];
             if self.store.is_allowed(real) {
-                out.push_str(real);
-            } else {
-                let ph = self.vault.placeholder_for(&s.label, real);
-                out.push_str(&ph);
-                if s.source != "dictionary" && !self.is_known(real) {
-                    self.push_suggestion(real);
-                }
+                continue;
             }
+            if s.source != "dictionary" && !self.is_known(real) {
+                self.push_suggestion(real);
+            }
+            kept.push(CachedSpan {
+                start: s.start,
+                end: s.end,
+                label: s.label,
+            });
+        }
+        kept
+    }
+
+    /// Replace each span with its placeholder from `vault`.
+    fn apply_spans(vault: &mut Vault, seg: &str, spans: &[CachedSpan]) -> String {
+        let mut out = String::with_capacity(seg.len());
+        let mut cursor = 0usize;
+        for s in spans {
+            out.push_str(&seg[cursor..s.start]);
+            out.push_str(&vault.placeholder_for(&s.label, &seg[s.start..s.end]));
             cursor = s.end;
         }
         out.push_str(&seg[cursor..]);
         out
     }
 
-    /// Redact a whole outbound payload using delta-scan.
+    /// Redact a whole outbound payload using delta-scan, minting placeholders in
+    /// `vault`.
     ///
-    /// Invariant 1: a cache hit re-emits the **redacted** form, never the raw input.
+    /// Give each request its **own** vault (see [`Vault`]): placeholders are only
+    /// meaningful within one conversation, and a vault shared between clients would
+    /// restore one client's values into another client's response.
+    ///
+    /// Invariant 1: the cache holds span offsets, never raw text, and a hit
+    /// re-emits the **redacted** form.
     /// Invariant 2: every segment passes through here — there is no bypass path.
-    pub fn process(&mut self, segments: &[String]) -> Vec<String> {
+    pub fn process_with(&mut self, vault: &mut Vault, segments: &[String]) -> Vec<String> {
+        if self.cache.len() >= CACHE_LIMIT {
+            self.cache.clear();
+        }
         // Compiled once per call, and only if some segment misses the cache.
         let mut dict: Option<DictionaryDetector> = None;
-        segments
-            .iter()
-            .map(|seg| {
-                let h = Self::hash(seg);
-                match self.cache.get(&h).cloned() {
-                    Some(redacted) => redacted,
-                    None => {
-                        let dict = dict.get_or_insert_with(|| DictionaryDetector::new(&self.store));
-                        let redacted = self.redact_segment(dict, seg);
-                        self.cache.insert(h, redacted.clone());
-                        redacted
-                    }
+        let mut out = Vec::with_capacity(segments.len());
+        for seg in segments {
+            let h = Self::hash(seg);
+            let spans = match self.cache.get(&h) {
+                Some(spans) => spans.clone(),
+                None => {
+                    let dict = dict.get_or_insert_with(|| DictionaryDetector::new(&self.store));
+                    let spans = self.detect_spans(dict, seg);
+                    self.cache.insert(h, spans.clone());
+                    spans
                 }
-            })
-            .collect()
+            };
+            out.push(Self::apply_spans(vault, seg, &spans));
+        }
+        out
+    }
+
+    /// [`Gateway::process_with`] against the gateway's own vault. Meant for the
+    /// single-user CLI and for tests; the proxy uses one vault per request.
+    pub fn process(&mut self, segments: &[String]) -> Vec<String> {
+        let mut vault = std::mem::take(&mut self.vault);
+        let out = self.process_with(&mut vault, segments);
+        self.vault = vault;
+        out
     }
 
     /// Invariant 4: fail-closed outbound assertion (cheap; no model).

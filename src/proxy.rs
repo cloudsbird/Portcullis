@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-use crate::Gateway;
+use crate::{Gateway, Vault};
 
 /// Attempts made when the *connection* fails. A connect error means the request
 /// never reached the provider, so retrying cannot double-charge or double-generate.
@@ -558,12 +558,14 @@ async fn handle(
     // Redact all text-bearing strings in one batch (better cache hit rate).
     // Detection is CPU-bound and synchronous, so it runs on the blocking pool
     // rather than stalling an async worker thread.
-    let redacted_texts = {
+    let (redacted_texts, vault) = {
         let gateway = state.gateway.clone();
         let texts = texts_to_redact.clone();
         tokio::task::spawn_blocking(move || {
             let mut gw = gateway.blocking_lock();
-            gw.process(&texts)
+            let mut vault = Vault::new();
+            let out = gw.process_with(&mut vault, &texts);
+            (out, vault)
         })
         .await
         .map_err(|e| {
@@ -611,7 +613,7 @@ async fn handle(
     .await?;
 
     if streaming {
-        return stream_response(state, upstream_resp).await;
+        return stream_response(Arc::new(vault), upstream_resp).await;
     }
 
     let status = upstream_resp.status();
@@ -623,14 +625,13 @@ async fn handle(
     // Rehydrate assistant text locally before returning to the caller. Covers
     // content, reasoning content, and tool-call arguments.
     {
-        let gw = state.gateway.lock().await;
         if let Some(choices) = upstream_json
             .get_mut("choices")
             .and_then(|c| c.as_array_mut())
         {
             for choice in choices.iter_mut() {
                 if let Some(msg) = choice.get_mut("message") {
-                    rehydrate_response_message(msg, &gw);
+                    rehydrate_response_message(msg, &vault);
                 }
             }
         }
@@ -667,12 +668,14 @@ async fn handle_anthropic(
     // Redact all text-bearing strings in one batch (better cache hit rate).
     // Detection is CPU-bound and synchronous, so it runs on the blocking pool
     // rather than stalling an async worker thread.
-    let redacted_texts = {
+    let (redacted_texts, vault) = {
         let gateway = state.gateway.clone();
         let texts = texts_to_redact.clone();
         tokio::task::spawn_blocking(move || {
             let mut gw = gateway.blocking_lock();
-            gw.process(&texts)
+            let mut vault = Vault::new();
+            let out = gw.process_with(&mut vault, &texts);
+            (out, vault)
         })
         .await
         .map_err(|e| {
@@ -722,7 +725,7 @@ async fn handle_anthropic(
     .await?;
 
     if streaming {
-        return anthropic_stream_response(state, upstream_resp).await;
+        return anthropic_stream_response(Arc::new(vault), upstream_resp).await;
     }
 
     let status = upstream_resp.status();
@@ -731,15 +734,12 @@ async fn handle_anthropic(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
-    {
-        let gw = state.gateway.lock().await;
-        rehydrate_anthropic_response(&mut upstream_json, &gw);
-    }
+    rehydrate_anthropic_response(&mut upstream_json, &vault);
 
     Ok((status, Json(upstream_json)).into_response())
 }
 
-fn rehydrate_anthropic_response(body: &mut Value, gw: &Gateway) {
+fn rehydrate_anthropic_response(body: &mut Value, vault: &Vault) {
     let Some(content) = body.get_mut("content").and_then(|c| c.as_array_mut()) else {
         return;
     };
@@ -748,12 +748,12 @@ fn rehydrate_anthropic_response(body: &mut Value, gw: &Gateway) {
         match map.get("type").and_then(|t| t.as_str()) {
             Some("text") => {
                 if let Some(Value::String(s)) = map.get_mut("text") {
-                    *s = gw.rehydrate(s);
+                    *s = vault.restore(s);
                 }
             }
             Some("tool_use") => {
                 if let Some(input) = map.get_mut("input") {
-                    rehydrate_string_leaves(input, gw);
+                    rehydrate_string_leaves(input, vault);
                 }
             }
             _ => {}
@@ -761,17 +761,17 @@ fn rehydrate_anthropic_response(body: &mut Value, gw: &Gateway) {
     }
 }
 
-fn rehydrate_string_leaves(value: &mut Value, gw: &Gateway) {
+fn rehydrate_string_leaves(value: &mut Value, vault: &Vault) {
     match value {
-        Value::String(s) => *s = gw.rehydrate(s),
+        Value::String(s) => *s = vault.restore(s),
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                rehydrate_string_leaves(item, gw);
+                rehydrate_string_leaves(item, vault);
             }
         }
         Value::Object(map) => {
             for (_, v) in map.iter_mut() {
-                rehydrate_string_leaves(v, gw);
+                rehydrate_string_leaves(v, vault);
             }
         }
         _ => {}
@@ -786,7 +786,7 @@ fn rehydrate_string_leaves(value: &mut Value, gw: &Gateway) {
 /// `data:` line chunk by chunk while buffering incomplete SSE events so that
 /// placeholders split across TCP chunks are still restored correctly.
 async fn stream_response(
-    state: ProxyState,
+    vault: Arc<Vault>,
     upstream_resp: reqwest::Response,
 ) -> Result<Response, (StatusCode, String)> {
     let status = upstream_resp.status();
@@ -795,13 +795,12 @@ async fn stream_response(
         .get(reqwest::header::CONTENT_TYPE)
         .cloned();
 
-    let gw = state.gateway.clone();
     let bytes_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
         Box::pin(upstream_resp.bytes_stream());
 
     let stream = futures::stream::try_unfold(
-        (String::new(), StreamCarry::default(), bytes_stream, gw),
-        |(mut buf, mut carry, mut stream, gw)| async move {
+        (String::new(), StreamCarry::default(), bytes_stream, vault),
+        |(mut buf, mut carry, mut stream, vault)| async move {
             loop {
                 // Emit a complete SSE event as soon as we have the blank-line
                 // delimiter. `carry` additionally holds back a partial
@@ -809,10 +808,10 @@ async fn stream_response(
                 if let Some(event_end) = buf.find("\n\n") {
                     let after = buf.split_off(event_end + 2);
                     let event = std::mem::replace(&mut buf, after);
-                    let processed = process_sse_event(&event, &mut carry, &gw).await;
+                    let processed = process_sse_event(&event, &mut carry, &vault);
                     return Ok::<_, std::io::Error>(Some((
                         Bytes::from(processed),
-                        (buf, carry, stream, gw),
+                        (buf, carry, stream, vault),
                     )));
                 }
 
@@ -824,15 +823,15 @@ async fn stream_response(
                         let mut tail = if buf.is_empty() {
                             String::new()
                         } else {
-                            let processed = process_sse_event(&buf, &mut carry, &gw).await;
+                            let processed = process_sse_event(&buf, &mut carry, &vault);
                             buf.clear();
                             processed
                         };
-                        tail.push_str(&flush_carry(&mut carry, &gw).await);
+                        tail.push_str(&flush_carry(&mut carry, &vault));
                         if tail.is_empty() {
                             return Ok(None);
                         }
-                        return Ok(Some((Bytes::from(tail), (buf, carry, stream, gw))));
+                        return Ok(Some((Bytes::from(tail), (buf, carry, stream, vault))));
                     }
                     Err(e) => {
                         return Err(std::io::Error::other(e));
@@ -886,7 +885,7 @@ fn split_partial_placeholder(combined: &str) -> (&str, &str) {
 
 /// Rehydrate `text`, prepending and updating the carry buffer so a placeholder
 /// split across events is restored as a single unit.
-fn rehydrate_with_carry(text: &str, pending: &mut String, gw: &Gateway) -> String {
+fn rehydrate_with_carry(text: &str, pending: &mut String, vault: &Vault) -> String {
     let combined = format!("{pending}{text}");
     let (emit, held) = split_partial_placeholder(&combined);
     let (emit, held) = if held.len() > MAX_PENDING {
@@ -897,21 +896,20 @@ fn rehydrate_with_carry(text: &str, pending: &mut String, gw: &Gateway) -> Strin
     };
     let emit_owned = emit.to_string();
     *pending = held.to_string();
-    gw.rehydrate(&emit_owned)
+    vault.restore(&emit_owned)
 }
 
 /// Emit any held-back text as a final synthetic delta event.
-async fn flush_carry(carry: &mut StreamCarry, gw: &Arc<Mutex<Gateway>>) -> String {
+fn flush_carry(carry: &mut StreamCarry, vault: &Vault) -> String {
     if carry.content.is_empty() && carry.args.is_empty() && carry.reasoning.is_empty() {
         return String::new();
     }
-    let gw_guard = gw.lock().await;
     let mut deltas = Vec::new();
     if !carry.content.is_empty() {
         let held = std::mem::take(&mut carry.content);
         deltas.push(json!({
             "index": 0,
-            "delta": { "content": gw_guard.rehydrate(&held) },
+            "delta": { "content": vault.restore(&held) },
             "finish_reason": null
         }));
     }
@@ -919,7 +917,7 @@ async fn flush_carry(carry: &mut StreamCarry, gw: &Arc<Mutex<Gateway>>) -> Strin
         let held = std::mem::take(&mut carry.reasoning);
         deltas.push(json!({
             "index": 0,
-            "delta": { "reasoning_content": gw_guard.rehydrate(&held) },
+            "delta": { "reasoning_content": vault.restore(&held) },
             "finish_reason": null
         }));
     }
@@ -929,7 +927,7 @@ async fn flush_carry(carry: &mut StreamCarry, gw: &Arc<Mutex<Gateway>>) -> Strin
             "index": 0,
             "delta": { "tool_calls": [ {
                 "index": 0,
-                "function": { "arguments": gw_guard.rehydrate(&held) }
+                "function": { "arguments": vault.restore(&held) }
             } ] },
             "finish_reason": null
         }));
@@ -942,22 +940,18 @@ async fn flush_carry(carry: &mut StreamCarry, gw: &Arc<Mutex<Gateway>>) -> Strin
 ///
 /// `carry` holds back a partial placeholder that spans two events; it is
 /// flushed before `[DONE]` and again at end of stream.
-async fn process_sse_event(
-    event: &str,
-    carry: &mut StreamCarry,
-    gw: &Arc<Mutex<Gateway>>,
-) -> String {
+fn process_sse_event(event: &str, carry: &mut StreamCarry, vault: &Vault) -> String {
     let mut out = String::new();
     for line in event.lines() {
         if let Some(payload) = line.strip_prefix("data: ") {
             if payload == "[DONE]" {
                 // Flush anything still held back before terminating.
-                out.push_str(&flush_carry(carry, gw).await);
+                out.push_str(&flush_carry(carry, vault));
                 out.push_str(line);
             } else {
                 match serde_json::from_str::<Value>(payload) {
                     Ok(mut value) => {
-                        rehydrate_sse_delta(&mut value, carry, gw).await;
+                        rehydrate_sse_delta(&mut value, carry, vault);
                         out.push_str("data: ");
                         match serde_json::to_string(&value) {
                             Ok(serialized) => out.push_str(&serialized),
@@ -980,38 +974,37 @@ async fn process_sse_event(
 /// Apply `Gateway::rehydrate` to every text-bearing delta field in a streaming
 /// chunk: `choices[].delta.content`, `choices[].delta.reasoning_content`, and
 /// `choices[].delta.tool_calls[].function.arguments`.
-async fn rehydrate_sse_delta(value: &mut Value, carry: &mut StreamCarry, gw: &Arc<Mutex<Gateway>>) {
+fn rehydrate_sse_delta(value: &mut Value, carry: &mut StreamCarry, vault: &Vault) {
     let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) else {
         return;
     };
-    let gw_guard = gw.lock().await;
     for choice in choices.iter_mut() {
         let Some(delta) = choice.get_mut("delta") else {
             continue;
         };
         if let Some(Value::String(content)) = delta.get_mut("content") {
-            let rehydrated = rehydrate_with_carry(content, &mut carry.content, &gw_guard);
+            let rehydrated = rehydrate_with_carry(content, &mut carry.content, vault);
             *content = rehydrated;
         }
         // Reasoning models stream a second text field. Without this, a
         // placeholder the model *reasoned* about comes back to the client as a
         // literal `<<ORG_1>>`.
         if let Some(Value::String(reasoning)) = delta.get_mut("reasoning_content") {
-            let rehydrated = rehydrate_with_carry(reasoning, &mut carry.reasoning, &gw_guard);
+            let rehydrated = rehydrate_with_carry(reasoning, &mut carry.reasoning, vault);
             *reasoning = rehydrated;
         }
         if let Some(tool_calls) = delta.get_mut("tool_calls") {
-            rehydrate_tool_calls(tool_calls, &mut carry.args, &gw_guard);
+            rehydrate_tool_calls(tool_calls, &mut carry.args, vault);
         }
     }
 }
 
 /// Rehydrate the text-bearing fields of a complete (non-streaming) assistant
 /// message: content, reasoning content, and tool-call arguments.
-fn rehydrate_response_message(msg: &mut Value, gw: &Gateway) {
+fn rehydrate_response_message(msg: &mut Value, vault: &Vault) {
     for field in ["content", "reasoning_content"] {
         if let Some(Value::String(text)) = msg.get_mut(field) {
-            *text = gw.rehydrate(text);
+            *text = vault.restore(text);
         }
     }
     if let Some(calls) = msg.get_mut("tool_calls").and_then(|c| c.as_array_mut()) {
@@ -1020,13 +1013,13 @@ fn rehydrate_response_message(msg: &mut Value, gw: &Gateway) {
                 .get_mut("function")
                 .and_then(|f| f.get_mut("arguments"))
             {
-                *args = gw.rehydrate(args);
+                *args = vault.restore(args);
             }
         }
     }
 }
 
-fn rehydrate_tool_calls(tool_calls: &mut Value, pending: &mut String, gw: &Gateway) {
+fn rehydrate_tool_calls(tool_calls: &mut Value, pending: &mut String, vault: &Vault) {
     let Some(calls) = tool_calls.as_array_mut() else {
         return;
     };
@@ -1035,7 +1028,7 @@ fn rehydrate_tool_calls(tool_calls: &mut Value, pending: &mut String, gw: &Gatew
             continue;
         };
         if let Some(Value::String(args)) = func.get_mut("arguments") {
-            let rehydrated = rehydrate_with_carry(args, pending, gw);
+            let rehydrated = rehydrate_with_carry(args, pending, vault);
             *args = rehydrated;
         }
     }
@@ -1048,7 +1041,7 @@ fn rehydrate_tool_calls(tool_calls: &mut Value, pending: &mut String, gw: &Gatew
 /// Forward an Anthropic streaming upstream response, rehydrating text and
 /// input_json deltas while reusing the placeholder-level carry buffer.
 async fn anthropic_stream_response(
-    state: ProxyState,
+    vault: Arc<Vault>,
     upstream_resp: reqwest::Response,
 ) -> Result<Response, (StatusCode, String)> {
     let status = upstream_resp.status();
@@ -1057,21 +1050,20 @@ async fn anthropic_stream_response(
         .get(reqwest::header::CONTENT_TYPE)
         .cloned();
 
-    let gw = state.gateway.clone();
     let bytes_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
         Box::pin(upstream_resp.bytes_stream());
 
     let stream = futures::stream::try_unfold(
-        (String::new(), StreamCarry::default(), bytes_stream, gw),
-        |(mut buf, mut carry, mut stream, gw)| async move {
+        (String::new(), StreamCarry::default(), bytes_stream, vault),
+        |(mut buf, mut carry, mut stream, vault)| async move {
             loop {
                 if let Some(event_end) = buf.find("\n\n") {
                     let after = buf.split_off(event_end + 2);
                     let event = std::mem::replace(&mut buf, after);
-                    let processed = process_anthropic_sse_event(&event, &mut carry, &gw).await;
+                    let processed = process_anthropic_sse_event(&event, &mut carry, &vault);
                     return Ok::<_, std::io::Error>(Some((
                         Bytes::from(processed),
-                        (buf, carry, stream, gw),
+                        (buf, carry, stream, vault),
                     )));
                 }
 
@@ -1083,16 +1075,15 @@ async fn anthropic_stream_response(
                         let mut tail = if buf.is_empty() {
                             String::new()
                         } else {
-                            let processed =
-                                process_anthropic_sse_event(&buf, &mut carry, &gw).await;
+                            let processed = process_anthropic_sse_event(&buf, &mut carry, &vault);
                             buf.clear();
                             processed
                         };
-                        tail.push_str(&flush_anthropic_carry(&mut carry, &gw).await);
+                        tail.push_str(&flush_anthropic_carry(&mut carry, &vault));
                         if tail.is_empty() {
                             return Ok(None);
                         }
-                        return Ok(Some((Bytes::from(tail), (buf, carry, stream, gw))));
+                        return Ok(Some((Bytes::from(tail), (buf, carry, stream, vault))));
                     }
                     Err(e) => {
                         return Err(std::io::Error::other(e));
@@ -1115,11 +1106,7 @@ async fn anthropic_stream_response(
 ///
 /// `carry` holds back a partial placeholder that spans two events; it is
 /// flushed before `message_stop` and again at end of stream.
-async fn process_anthropic_sse_event(
-    event: &str,
-    carry: &mut StreamCarry,
-    gw: &Arc<Mutex<Gateway>>,
-) -> String {
+fn process_anthropic_sse_event(event: &str, carry: &mut StreamCarry, vault: &Vault) -> String {
     let mut out = String::new();
 
     // If this event carries `message_stop`, flush any held-back placeholder
@@ -1134,14 +1121,14 @@ async fn process_anthropic_sse_event(
             .unwrap_or(false)
     });
     if is_message_stop {
-        out.push_str(&flush_anthropic_carry(carry, gw).await);
+        out.push_str(&flush_anthropic_carry(carry, vault));
     }
 
     for line in event.lines() {
         if let Some(payload) = line.strip_prefix("data: ") {
             match serde_json::from_str::<Value>(payload) {
                 Ok(mut value) => {
-                    rehydrate_anthropic_sse_delta(&mut value, carry, gw).await;
+                    rehydrate_anthropic_sse_delta(&mut value, carry, vault);
                     out.push_str("data: ");
                     match serde_json::to_string(&value) {
                         Ok(serialized) => out.push_str(&serialized),
@@ -1161,11 +1148,7 @@ async fn process_anthropic_sse_event(
 }
 
 /// Apply `Gateway::rehydrate` to text-bearing Anthropic streaming deltas.
-async fn rehydrate_anthropic_sse_delta(
-    value: &mut Value,
-    carry: &mut StreamCarry,
-    gw: &Arc<Mutex<Gateway>>,
-) {
+fn rehydrate_anthropic_sse_delta(value: &mut Value, carry: &mut StreamCarry, vault: &Vault) {
     if value.get("type").and_then(|t| t.as_str()) != Some("content_block_delta") {
         return;
     }
@@ -1174,17 +1157,16 @@ async fn rehydrate_anthropic_sse_delta(
     };
     let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-    let gw_guard = gw.lock().await;
     match delta_type {
         "text_delta" => {
             if let Some(Value::String(content)) = delta.get_mut("text") {
-                let rehydrated = rehydrate_with_carry(content, &mut carry.content, &gw_guard);
+                let rehydrated = rehydrate_with_carry(content, &mut carry.content, vault);
                 *content = rehydrated;
             }
         }
         "input_json_delta" => {
             if let Some(Value::String(partial_json)) = delta.get_mut("partial_json") {
-                let rehydrated = rehydrate_with_carry(partial_json, &mut carry.args, &gw_guard);
+                let rehydrated = rehydrate_with_carry(partial_json, &mut carry.args, vault);
                 *partial_json = rehydrated;
             }
         }
@@ -1193,18 +1175,17 @@ async fn rehydrate_anthropic_sse_delta(
 }
 
 /// Emit held-back Anthropic placeholder text as final synthetic deltas.
-async fn flush_anthropic_carry(carry: &mut StreamCarry, gw: &Arc<Mutex<Gateway>>) -> String {
+fn flush_anthropic_carry(carry: &mut StreamCarry, vault: &Vault) -> String {
     if carry.content.is_empty() && carry.args.is_empty() {
         return String::new();
     }
-    let gw_guard = gw.lock().await;
     let mut events = Vec::new();
     if !carry.content.is_empty() {
         let held = std::mem::take(&mut carry.content);
         let payload = json!({
             "type": "content_block_delta",
             "index": 0,
-            "delta": { "type": "text_delta", "text": gw_guard.rehydrate(&held) }
+            "delta": { "type": "text_delta", "text": vault.restore(&held) }
         });
         events.push(format!("event: content_block_delta\ndata: {payload}\n\n"));
     }
@@ -1213,7 +1194,7 @@ async fn flush_anthropic_carry(carry: &mut StreamCarry, gw: &Arc<Mutex<Gateway>>
         let payload = json!({
             "type": "content_block_delta",
             "index": 0,
-            "delta": { "type": "input_json_delta", "partial_json": gw_guard.rehydrate(&held) }
+            "delta": { "type": "input_json_delta", "partial_json": vault.restore(&held) }
         });
         events.push(format!("event: content_block_delta\ndata: {payload}\n\n"));
     }

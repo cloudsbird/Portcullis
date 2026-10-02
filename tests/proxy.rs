@@ -304,3 +304,64 @@ async fn proxy_redacts_multimodal_content_parts() {
         content[0]["text"]
     );
 }
+
+async fn echo_placeholders_handler() -> Json<Value> {
+    Json(json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Re: <<ORG_1>> / <<EMAIL_1>>" },
+            "finish_reason": "stop"
+        }]
+    }))
+}
+
+/// One client's values must never be restored into another client's response,
+/// even when the upstream (or a prompt-injected model) emits their placeholders.
+#[tokio::test]
+async fn placeholders_do_not_leak_across_requests() {
+    let mut store = Store::default();
+    store.teach("Cartalian", "ORG", "global");
+    let gw = Gateway::new(store);
+
+    let upstream_url =
+        spawn_server(Router::new().route("/v1/chat/completions", post(echo_placeholders_handler)))
+            .await;
+    let client = Client::new();
+    let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
+    let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
+
+    let ask = |text: &'static str| {
+        let client = client.clone();
+        let url = proxy_url.clone();
+        async move {
+            client
+                .post(&url)
+                .json(&json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": text}]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        }
+    };
+
+    let a = ask("Cartalian, alice@example.com").await;
+    assert!(
+        a.contains("Cartalian") && a.contains("alice@example.com"),
+        "{a}"
+    );
+
+    let b = ask("A harmless question.").await;
+    assert!(
+        !b.contains("Cartalian") && !b.contains("alice@example.com"),
+        "client B received client A's values: {b}"
+    );
+}
