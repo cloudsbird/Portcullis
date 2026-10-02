@@ -102,11 +102,14 @@ impl Store {
     }
 
     /// Teach a term, choosing whether it only matches as a whole word.
+    ///
+    /// Idempotent by (term, scope): the same word taught for two scopes is two
+    /// entries, so teaching it for one client never rewrites another client's.
     pub fn teach_with(&mut self, term: &str, label: &str, scope: &str, whole_word: bool) {
         if let Some(e) = self
             .deny
             .iter_mut()
-            .find(|e| e.term.eq_ignore_ascii_case(term))
+            .find(|e| e.term.eq_ignore_ascii_case(term) && e.scope.eq_ignore_ascii_case(scope))
         {
             e.label = label.to_string();
             e.whole_word = whole_word;
@@ -122,15 +125,30 @@ impl Store {
         });
     }
 
-    /// Remove a taught term. Returns whether anything changed.
+    /// Remove a taught term from every scope. Returns whether anything changed.
     pub fn unteach(&mut self, term: &str) -> bool {
+        self.unteach_in(term, None)
+    }
+
+    /// Remove a taught term, from one scope or (`None`) from all of them.
+    pub fn unteach_in(&mut self, term: &str, scope: Option<&str>) -> bool {
         let before = self.deny.len();
-        self.deny.retain(|e| !e.term.eq_ignore_ascii_case(term));
+        self.deny.retain(|e| {
+            !(e.term.eq_ignore_ascii_case(term)
+                && scope.is_none_or(|s| e.scope.eq_ignore_ascii_case(s)))
+        });
         before != self.deny.len()
     }
 
     pub fn is_allowed(&self, term: &str) -> bool {
-        self.allow.iter().any(|e| e.term.eq_ignore_ascii_case(term))
+        self.is_allowed_for(None, term)
+    }
+
+    /// Whether `term` is on the allow-list for `scope` (see [`applies`]).
+    pub fn is_allowed_for(&self, scope: Option<&str>, term: &str) -> bool {
+        self.allow
+            .iter()
+            .any(|e| applies(&e.scope, scope) && e.term.eq_ignore_ascii_case(term))
     }
 
     /// Every surface form that must be hidden: terms plus their aliases.
@@ -143,8 +161,13 @@ impl Store {
 
     /// Like [`Store::hidden_forms`], with the matching mode of each form.
     pub fn hidden_entries(&self) -> Vec<HiddenForm> {
+        self.hidden_entries_for(None)
+    }
+
+    /// The forms that apply to a request in `scope` (see [`applies`]).
+    pub fn hidden_entries_for(&self, scope: Option<&str>) -> Vec<HiddenForm> {
         let mut v = Vec::new();
-        for e in &self.deny {
+        for e in self.deny.iter().filter(|e| applies(&e.scope, scope)) {
             for form in std::iter::once(&e.term).chain(&e.aliases) {
                 v.push(HiddenForm {
                     form: form.clone(),
@@ -154,6 +177,22 @@ impl Store {
             }
         }
         v
+    }
+}
+
+/// The scope shared by every request.
+pub const GLOBAL_SCOPE: &str = "global";
+
+/// Does an entry taught under `entry_scope` apply to a request in `request_scope`?
+///
+/// * `None` — single-tenant mode: no scopes are configured, every entry applies.
+/// * `Some(s)` — multi-tenant: `global` entries and entries for `s`, nothing else.
+pub fn applies(entry_scope: &str, request_scope: Option<&str>) -> bool {
+    match request_scope {
+        None => true,
+        Some(s) => {
+            entry_scope.eq_ignore_ascii_case(GLOBAL_SCOPE) || entry_scope.eq_ignore_ascii_case(s)
+        }
     }
 }
 
@@ -185,6 +224,26 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn the_same_term_taught_for_two_scopes_stays_two_entries() {
+        let mut s = Store::default();
+        s.teach("Acme", "ORG", "alpha");
+        s.teach("Acme", "CLIENT", "beta");
+        assert_eq!(s.deny.len(), 2);
+        assert_eq!(s.hidden_entries_for(Some("alpha")).len(), 1);
+        assert_eq!(s.hidden_entries_for(Some("alpha"))[0].label, "ORG");
+        assert!(s.hidden_entries_for(Some("gamma")).is_empty());
+        assert_eq!(
+            s.hidden_entries_for(None).len(),
+            2,
+            "single-tenant: all apply"
+        );
+
+        assert!(s.unteach_in("acme", Some("alpha")));
+        assert_eq!(s.deny.len(), 1);
+        assert_eq!(s.deny[0].scope, "beta");
     }
 
     #[test]

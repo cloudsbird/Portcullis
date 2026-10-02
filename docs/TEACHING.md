@@ -186,7 +186,7 @@ Being precise here matters more than looking complete.
 |---|---|
 | **Retrain anything** | By design. No model weights change; teaching is a list append. |
 | **Encrypt the store** | `store.json` is **plaintext JSON** on disk today. Protect it with filesystem permissions, and keep it off version control. |
-| **Enforce `scope`** | `scope` (`global` / `client` / `session`) is **stored and displayed, but not applied** — every taught term currently affects every request. Scoping is a schema slot, not a behaviour yet. |
+| **Isolate clients by default** | `scope` is enforced only when you configure per-client tokens — see [SCOPES.md](SCOPES.md). Without them, every taught term applies to every request. |
 | **Populate `aliases`** | The lookup honours aliases, but nothing can add one — `teach` always writes an empty list, and there is no CLI/HTTP surface for it. Teach each spelling for now. |
 | **Catch variants automatically** | `Aerolith` and `Aerolith Inc.` are different strings. Teach both, or wait for fuzzy expansion (below). |
 | **Fuzzy/trained expansion** | The planned tiers — expansion via local embeddings, then a LoRA fine-tune of the detector — are **not implemented**. |
@@ -201,7 +201,7 @@ Being precise here matters more than looking complete.
 | Auto-suggest of untaught detections | ✅ implemented, tested |
 | Bearer auth on the learning surface | ✅ implemented, tested |
 | Re-teach updates a label | ✅ implemented |
-| `scope` enforcement | ❌ stored only |
+| `scope` enforcement | ✅ opt-in via per-client tokens ([SCOPES.md](SCOPES.md)) |
 | `aliases` API | ❌ plumbing only |
 | Store encryption at rest | ❌ plaintext |
 | Embedding expansion / fine-tuning | ❌ not started |

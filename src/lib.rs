@@ -24,5 +24,5 @@ pub mod vault;
 
 pub use model::DetectorSettings;
 pub use pipeline::Gateway;
-pub use store::{Entry, HiddenForm, Store};
+pub use store::{applies, Entry, HiddenForm, Store, GLOBAL_SCOPE};
 pub use vault::Vault;

@@ -155,8 +155,9 @@ What is **not** closed, and I would not pretend otherwise:
    was available. Its SSE shapes are different, so treat it as unverified against reality.
 2. **The store is not encrypted at rest.** It is `0600` on disk, and gitignored, but it is
    plaintext JSON: a map of everything you consider private.
-3. **`scope` is recorded but not enforced.** Every taught term applies to every request,
-   so there is no per-client isolation despite the schema implying it.
+3. **Scope isolation is opt-in, and is selection, not a security boundary.** See
+   [SCOPES.md](SCOPES.md): per-client tokens pick which terms apply, but the operator,
+   the store file, the provider key and the detector are shared.
 4. **Detection serialises** (see Concurrency), so throughput is bounded.
 5. **No metrics/tracing export** — logs only, no Prometheus/OTLP.
 

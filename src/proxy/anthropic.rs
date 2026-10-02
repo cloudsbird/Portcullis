@@ -211,6 +211,10 @@ pub(super) async fn handle_anthropic(
     headers: HeaderMap,
     body: Value,
 ) -> Result<Response, (StatusCode, String)> {
+    // Who is asking decides which taught terms apply. Rejected before any body is
+    // read or forwarded.
+    let scope = resolve_scope(&state, &headers)?;
+
     // Collect every redactable string while preserving all other fields.
     let mut redacted_body = body.clone();
     let mut texts_to_redact: Vec<String> = Vec::new();
@@ -222,10 +226,11 @@ pub(super) async fn handle_anthropic(
     let (redacted_texts, vault) = {
         let gateway = state.gateway.clone();
         let texts = texts_to_redact.clone();
+        let scope = scope.clone();
         tokio::task::spawn_blocking(move || {
             let mut gw = gateway.blocking_lock();
             let mut vault = Vault::new();
-            let out = gw.process_with(&mut vault, &texts);
+            let out = gw.process_scoped(scope.as_deref(), &mut vault, &texts);
             (out, vault)
         })
         .await
@@ -248,7 +253,7 @@ pub(super) async fn handle_anthropic(
         let gw = state.gateway.lock().await;
         let assembled = serde_json::to_string(&redacted_body)
             .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-        gw.assert_clean(&[assembled])
+        gw.assert_clean_scoped(scope.as_deref(), &[assembled])
             .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     }
 

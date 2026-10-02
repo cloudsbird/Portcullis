@@ -132,6 +132,10 @@ pub(super) async fn handle(
     headers: HeaderMap,
     body: Value,
 ) -> Result<Response, (StatusCode, String)> {
+    // Who is asking decides which taught terms apply. Rejected before any body is
+    // read or forwarded.
+    let scope = resolve_scope(&state, &headers)?;
+
     let messages = body.get("messages").and_then(|m| m.as_array()).ok_or((
         StatusCode::BAD_REQUEST,
         "missing or invalid messages".to_string(),
@@ -153,10 +157,11 @@ pub(super) async fn handle(
     let (redacted_texts, vault) = {
         let gateway = state.gateway.clone();
         let texts = texts_to_redact.clone();
+        let scope = scope.clone();
         tokio::task::spawn_blocking(move || {
             let mut gw = gateway.blocking_lock();
             let mut vault = Vault::new();
-            let out = gw.process_with(&mut vault, &texts);
+            let out = gw.process_scoped(scope.as_deref(), &mut vault, &texts);
             (out, vault)
         })
         .await
@@ -186,7 +191,7 @@ pub(super) async fn handle(
         let gw = state.gateway.lock().await;
         let assembled = serde_json::to_string(&upstream_body)
             .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-        gw.assert_clean(&[assembled])
+        gw.assert_clean_scoped(scope.as_deref(), &[assembled])
             .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     }
 

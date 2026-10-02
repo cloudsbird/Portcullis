@@ -32,7 +32,7 @@ pub struct Gateway {
     /// deterministic layers, so it can only add recall — never override the guarantee.
     extra: Option<Box<dyn Detector>>,
     /// Recent spans redacted by a non-dictionary detector (regex, ONNX, …).
-    suggestions: VecDeque<String>,
+    suggestions: VecDeque<(Option<String>, String)>,
 }
 
 impl Gateway {
@@ -108,32 +108,47 @@ impl Gateway {
         &self.vault
     }
 
-    /// Return the recent auto-suggest candidates.
+    /// Return the recent auto-suggest candidates, across every scope.
     pub fn suggestions(&self) -> Vec<String> {
-        self.suggestions.iter().cloned().collect()
+        let mut seen = std::collections::HashSet::new();
+        self.suggestions
+            .iter()
+            .filter(|(_, t)| seen.insert(t.as_str()))
+            .map(|(_, t)| t.clone())
+            .collect()
     }
 
-    fn is_known(&self, term: &str) -> bool {
-        if self.store.is_allowed(term) {
+    /// Candidates seen in traffic of one scope only (`None`: single-tenant traffic).
+    pub fn suggestions_for(&self, scope: Option<&str>) -> Vec<String> {
+        self.suggestions
+            .iter()
+            .filter(|(s, _)| s.as_deref() == scope)
+            .map(|(_, t)| t.clone())
+            .collect()
+    }
+
+    fn is_known(&self, scope: Option<&str>, term: &str) -> bool {
+        if self.store.is_allowed_for(scope, term) {
             return true;
         }
         let lower = term.to_lowercase();
         self.store
-            .hidden_forms()
+            .hidden_entries_for(scope)
             .iter()
-            .any(|(form, _)| form.to_lowercase() == lower)
+            .any(|h| h.form.to_lowercase() == lower)
     }
 
-    fn push_suggestion(&mut self, term: &str) {
+    fn push_suggestion(&mut self, scope: Option<&str>, term: &str) {
+        let entry = (scope.map(str::to_string), term.to_string());
         // Deduplicate: move an existing entry to the back so repeats do not
         // flood the bounded buffer, and the most recent sightings are kept.
-        if let Some(pos) = self.suggestions.iter().position(|t| t == term) {
+        if let Some(pos) = self.suggestions.iter().position(|e| *e == entry) {
             self.suggestions.remove(pos);
         }
         if self.suggestions.len() >= SUGGESTION_LIMIT {
             self.suggestions.pop_front();
         }
-        self.suggestions.push_back(term.to_string());
+        self.suggestions.push_back(entry);
     }
 
     /// Teach a term. **Invalidates the delta cache** (invariant 3): a cached redaction
@@ -149,15 +164,24 @@ impl Gateway {
     }
 
     pub fn unteach(&mut self, term: &str) -> bool {
-        let changed = self.store.unteach(term);
+        self.unteach_in(term, None)
+    }
+
+    /// Remove a term from one scope, or (`None`) from every scope.
+    pub fn unteach_in(&mut self, term: &str, scope: Option<&str>) -> bool {
+        let changed = self.store.unteach_in(term, scope);
         if changed {
             self.cache.clear();
         }
         changed
     }
 
-    fn hash(seg: &str) -> String {
+    /// Cache key. The scope is part of it: the same text redacts differently for
+    /// different scopes, so a hit must never cross one.
+    fn hash(scope: Option<&str>, seg: &str) -> String {
         let mut h = Sha256::new();
+        h.update(scope.unwrap_or("\u{0}*").as_bytes());
+        h.update([0u8]);
         h.update(seg.as_bytes());
         hex::encode(h.finalize())
     }
@@ -166,7 +190,12 @@ impl Gateway {
     /// builtin patterns, then the optional ML detector. Returns offsets only —
     /// never the matched text — so the result is safe to cache and can be applied
     /// against any session's vault.
-    fn detect_spans(&mut self, dict: &DictionaryDetector, seg: &str) -> Vec<CachedSpan> {
+    fn detect_spans(
+        &mut self,
+        scope: Option<&str>,
+        dict: &DictionaryDetector,
+        seg: &str,
+    ) -> Vec<CachedSpan> {
         let mut spans = dict.detect(seg);
         spans.extend(self.regexes.detect(seg));
         if let Some(extra) = &self.extra {
@@ -175,11 +204,11 @@ impl Gateway {
         let mut kept = Vec::new();
         for s in merge(spans) {
             let real = &seg[s.start..s.end];
-            if self.store.is_allowed(real) {
+            if self.store.is_allowed_for(scope, real) {
                 continue;
             }
-            if s.source != "dictionary" && !self.is_known(real) {
-                self.push_suggestion(real);
+            if s.source != "dictionary" && !self.is_known(scope, real) {
+                self.push_suggestion(scope, real);
             }
             kept.push(CachedSpan {
                 start: s.start,
@@ -214,6 +243,18 @@ impl Gateway {
     /// re-emits the **redacted** form.
     /// Invariant 2: every segment passes through here — there is no bypass path.
     pub fn process_with(&mut self, vault: &mut Vault, segments: &[String]) -> Vec<String> {
+        self.process_scoped(None, vault, segments)
+    }
+
+    /// [`Gateway::process_with`] for a request in `scope`: only terms taught for that
+    /// scope or for `global` apply (see [`crate::applies`]). `None` is single-tenant
+    /// mode, where every term applies.
+    pub fn process_scoped(
+        &mut self,
+        scope: Option<&str>,
+        vault: &mut Vault,
+        segments: &[String],
+    ) -> Vec<String> {
         if self.cache.len() >= CACHE_LIMIT {
             self.cache.clear();
         }
@@ -221,12 +262,13 @@ impl Gateway {
         let mut dict: Option<DictionaryDetector> = None;
         let mut out = Vec::with_capacity(segments.len());
         for seg in segments {
-            let h = Self::hash(seg);
+            let h = Self::hash(scope, seg);
             let spans = match self.cache.get(&h) {
                 Some(spans) => spans.clone(),
                 None => {
-                    let dict = dict.get_or_insert_with(|| DictionaryDetector::new(&self.store));
-                    let spans = self.detect_spans(dict, seg);
+                    let dict = dict
+                        .get_or_insert_with(|| DictionaryDetector::for_scope(&self.store, scope));
+                    let spans = self.detect_spans(scope, dict, seg);
                     self.cache.insert(h, spans.clone());
                     spans
                 }
@@ -247,10 +289,19 @@ impl Gateway {
 
     /// Invariant 4: fail-closed outbound assertion (cheap; no model).
     pub fn assert_clean(&self, outbound: &[String]) -> Result<(), String> {
-        let dict = DictionaryDetector::new(&self.store);
+        self.assert_clean_scoped(None, outbound)
+    }
+
+    /// [`Gateway::assert_clean`] for a request in `scope`.
+    pub fn assert_clean_scoped(
+        &self,
+        scope: Option<&str>,
+        outbound: &[String],
+    ) -> Result<(), String> {
+        let dict = DictionaryDetector::for_scope(&self.store, scope);
         for seg in outbound {
             for span in dict.detect(seg) {
-                if !self.store.is_allowed(&seg[span.start..span.end]) {
+                if !self.store.is_allowed_for(scope, &seg[span.start..span.end]) {
                     return Err("residual protected term in outbound".into());
                 }
             }
@@ -277,13 +328,13 @@ mod tests {
 
         // Repeats must not flood the buffer.
         for _ in 0..10 {
-            gw.push_suggestion("repeat@example.com");
+            gw.push_suggestion(None, "repeat@example.com");
         }
         assert_eq!(gw.suggestions().len(), 1);
 
         // The buffer stays bounded at SUGGESTION_LIMIT.
         for i in 0..(SUGGESTION_LIMIT + 50) {
-            gw.push_suggestion(&format!("user{i}@example.com"));
+            gw.push_suggestion(None, &format!("user{i}@example.com"));
         }
         assert_eq!(gw.suggestions().len(), SUGGESTION_LIMIT);
     }

@@ -39,8 +39,13 @@ pub struct DictionaryDetector {
 
 impl DictionaryDetector {
     pub fn new(store: &Store) -> Self {
+        Self::for_scope(store, None)
+    }
+
+    /// The dictionary as seen by a request in `scope` (`None`: every entry).
+    pub fn for_scope(store: &Store, scope: Option<&str>) -> Self {
         let mut forms: Vec<HiddenForm> = store
-            .hidden_entries()
+            .hidden_entries_for(scope)
             .into_iter()
             .filter(|h| !h.form.is_empty())
             .collect();

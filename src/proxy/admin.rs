@@ -20,6 +20,9 @@ pub(super) struct TeachRequest {
 #[derive(Deserialize)]
 pub(super) struct UnteachRequest {
     term: String,
+    /// Remove only from this scope. Omitted: remove from every scope.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 pub(super) fn default_scope() -> String {
@@ -93,6 +96,24 @@ pub(super) async fn teach_handler(
         return e.into_response();
     }
 
+    // With scopes enabled, an unknown scope would protect nobody and never say so.
+    if !state.scope_tokens.is_empty()
+        && !req.scope.eq_ignore_ascii_case(crate::GLOBAL_SCOPE)
+        && !state
+            .scope_tokens
+            .iter()
+            .any(|(s, _)| s.eq_ignore_ascii_case(&req.scope))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown scope '{}': not 'global' and not configured",
+                req.scope
+            ),
+        )
+            .into_response();
+    }
+
     let path = store_path(&state);
     let mut gw = state.gateway.lock().await;
     gw.teach_with(&req.term, &req.label, &req.scope, req.whole_word);
@@ -114,7 +135,7 @@ pub(super) async fn unteach_handler(
 
     let path = store_path(&state);
     let mut gw = state.gateway.lock().await;
-    let removed = gw.unteach(&req.term);
+    let removed = gw.unteach_in(&req.term, req.scope.as_deref());
     if let Err(e) = gw.store.save(&path) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
@@ -136,15 +157,21 @@ pub(super) async fn terms_handler(State(state): State<ProxyState>, headers: Head
     Json(json!({ "terms": terms })).into_response()
 }
 
+/// `GET /suggestions[?scope=NAME]`: all candidates, or only those seen in one scope's
+/// traffic.
 pub(super) async fn suggestions_handler(
     State(state): State<ProxyState>,
     headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if let Err(e) = require_admin(&state, &headers) {
         return e.into_response();
     }
 
     let gw = state.gateway.lock().await;
-    let suggestions = gw.suggestions();
+    let suggestions = match query.get("scope") {
+        Some(scope) => gw.suggestions_for(Some(scope)),
+        None => gw.suggestions(),
+    };
     Json(json!({ "suggestions": suggestions })).into_response()
 }

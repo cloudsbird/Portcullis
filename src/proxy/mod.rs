@@ -64,6 +64,10 @@ pub struct ProxyState {
     pub forward_headers: Vec<String>,
     /// Static headers added to every upstream request, as `(name, value)`.
     pub extra_upstream_headers: Vec<(String, String)>,
+    /// `(scope, token)` pairs. Empty means single-tenant mode: every taught term
+    /// applies to every request. Non-empty means every request must present one of
+    /// these tokens and only sees `global` terms plus its own scope's.
+    pub scope_tokens: Vec<(String, String)>,
 }
 
 impl ProxyState {
@@ -87,6 +91,7 @@ impl ProxyState {
             started_at: Instant::now(),
             forward_headers: Vec::new(),
             extra_upstream_headers: Vec::new(),
+            scope_tokens: Vec::new(),
         }
     }
 }
@@ -312,6 +317,25 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
         parse_extra_headers(&std::env::var("PORTCULLIS_UPSTREAM_HEADERS").unwrap_or_default())
             .map_err(|e| anyhow::anyhow!(e))?;
 
+    // Multi-tenant isolation (M5). Validated now, so a misconfiguration stops startup
+    // instead of quietly weakening isolation.
+    let scope_tokens = load_scope_tokens()?;
+    if !scope_tokens.is_empty() {
+        if let Some(admin) = admin_token.as_deref() {
+            if scope_tokens.iter().any(|(_, t)| t == admin) {
+                anyhow::bail!("a scope token must not equal PORTCULLIS_ADMIN_TOKEN");
+            }
+        }
+        if let Some(bad) = forward_headers
+            .iter()
+            .find(|h| matches!(h.as_str(), "authorization" | "x-api-key"))
+        {
+            anyhow::bail!(
+                "PORTCULLIS_FORWARD_HEADERS must not include {bad} when scopes are enabled: it carries the client's scope token"
+            );
+        }
+    }
+
     let client = Client::builder()
         .use_rustls_tls()
         .connect_timeout(connect_timeout)
@@ -325,6 +349,7 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
     state.extra_upstream_headers = extra_upstream_headers;
     state.store_path = Some(store_path);
     state.admin_token = admin_token;
+    state.scope_tokens = scope_tokens;
     state.anthropic_upstream_url = anthropic_upstream_url;
     state.anthropic_upstream_key = anthropic_upstream_key;
     state.anthropic_version = anthropic_version;
@@ -341,9 +366,114 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
         forward_headers = ?state.forward_headers,
         extra_upstream_headers = state.extra_upstream_headers.len(),
         admin_api = state.admin_token.is_some(),
+        scopes = state.scope_tokens.len(),
         "portcullis listening"
     );
 
     axum::serve(listener, app(state)).await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Scopes (M5): per-client isolation
+// ---------------------------------------------------------------------------
+
+/// Parse `scope=token,scope=token` into `(scope, token)` pairs.
+///
+/// Strict on purpose: a typo here silently weakens isolation, so anything odd fails
+/// startup instead of being skipped.
+pub fn parse_scope_tokens(raw: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (scope, token) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("scope entry '{}' is not scope=token", redact_pair(pair)))?;
+        let (scope, token) = (scope.trim(), token.trim());
+        if scope.is_empty() || token.is_empty() {
+            return Err("a scope and its token must both be non-empty".into());
+        }
+        if scope.eq_ignore_ascii_case(crate::GLOBAL_SCOPE) {
+            return Err(format!(
+                "'{}' is reserved for terms shared by every client",
+                crate::GLOBAL_SCOPE
+            ));
+        }
+        if out.iter().any(|(s, _)| s.eq_ignore_ascii_case(scope)) {
+            return Err(format!("scope '{scope}' is listed twice"));
+        }
+        if out.iter().any(|(_, t)| t == token) {
+            // Two scopes sharing a token could not be told apart.
+            return Err(format!("scope '{scope}' reuses another scope's token"));
+        }
+        out.push((scope.to_string(), token.to_string()));
+    }
+    Ok(out)
+}
+
+/// Never echo a token (the part after `=`) into an error.
+fn redact_pair(pair: &str) -> &str {
+    pair.split_once('=').map_or("<malformed>", |(s, _)| s)
+}
+
+/// Load scope tokens from `PORTCULLIS_SCOPE_TOKENS` and, optionally, a JSON file
+/// (`{"scope": "token"}`) named by `PORTCULLIS_SCOPE_TOKENS_FILE`.
+fn load_scope_tokens() -> anyhow::Result<Vec<(String, String)>> {
+    let mut raw = std::env::var("PORTCULLIS_SCOPE_TOKENS").unwrap_or_default();
+    if let Ok(path) = std::env::var("PORTCULLIS_SCOPE_TOKENS_FILE") {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("cannot read PORTCULLIS_SCOPE_TOKENS_FILE: {e}"))?;
+        let map: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&text).map_err(|e| {
+                anyhow::anyhow!("PORTCULLIS_SCOPE_TOKENS_FILE is not a JSON object of strings: {e}")
+            })?;
+        for (scope, token) in map {
+            if !raw.is_empty() {
+                raw.push(',');
+            }
+            raw.push_str(&format!("{scope}={token}"));
+        }
+    }
+    parse_scope_tokens(&raw).map_err(|e| anyhow::anyhow!("invalid scope tokens: {e}"))
+}
+
+/// Decide which scope a request belongs to.
+///
+/// * No scope tokens configured: single-tenant mode, `Ok(None)`, every term applies.
+/// * Otherwise the request must present a configured token, as
+///   `Authorization: Bearer <token>` (OpenAI-style clients) or `x-api-key: <token>`
+///   (Anthropic-style). Anything else is rejected **before** a byte is processed or
+///   forwarded. The token proves the scope; a client cannot name another's.
+pub(super) fn resolve_scope(
+    state: &ProxyState,
+    headers: &HeaderMap,
+) -> Result<Option<String>, (StatusCode, String)> {
+    if state.scope_tokens.is_empty() {
+        return Ok(None);
+    }
+
+    let bearer = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "));
+    let api_key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+
+    // Compare against every configured token with no early exit, so response time
+    // does not reveal how close a guess was.
+    let mut found: Option<&str> = None;
+    for (scope, token) in &state.scope_tokens {
+        let mut hit = false;
+        for candidate in [bearer, api_key].into_iter().flatten() {
+            hit |= admin::constant_time_eq(candidate, token);
+        }
+        if hit {
+            found = Some(scope);
+        }
+    }
+    match found {
+        Some(scope) => Ok(Some(scope.to_string())),
+        None => Err((
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid scope token".into(),
+        )),
+    }
 }

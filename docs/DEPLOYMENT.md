@@ -329,8 +329,8 @@ localhost next to your client — but it makes a bind address a security decisio
 | Public internet | strangers can spend your credits | **don't** without auth in front |
 
 If you must share it, terminate auth in front of it (Caddy/nginx with basic auth or mTLS)
-rather than publishing the port. Per-token limits and per-client `scope` are not
-implemented yet — see [known gaps](OPERATIONS.md#before-this-guards-someone-elses-data).
+rather than publishing the port. Per-token rate limits are not
+implemented yet (per-client `scope` is — see [SCOPES.md](SCOPES.md)) — see [known gaps](OPERATIONS.md#before-this-guards-someone-elses-data).
 
 ---
 

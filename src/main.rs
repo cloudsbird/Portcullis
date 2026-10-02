@@ -46,6 +46,9 @@ enum Command {
         /// Match only at word boundaries (so "Ann" leaves "Anna" alone).
         #[arg(long)]
         whole_word: bool,
+        /// Who the term applies to: `global` (everyone) or a configured scope name.
+        #[arg(long, default_value = "global")]
+        scope: String,
     },
     /// Remove a taught term.
     Unteach { term: String },
@@ -103,9 +106,10 @@ async fn main() -> Result<()> {
             term,
             label,
             whole_word,
+            scope,
         } => {
             let mut gw = Gateway::with_settings(Store::load(&cli.store)?, &settings);
-            gw.teach_with(&term, &label, "global", whole_word);
+            gw.teach_with(&term, &label, &scope, whole_word);
             gw.store.save(&cli.store)?;
             println!("taught: {term} ({label})");
         }

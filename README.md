@@ -244,6 +244,7 @@ Everything is environment variables. The ones that matter most:
 | `PORTCULLIS_UPSTREAM_URL` | *(required)* | the provider to forward to |
 | `PORTCULLIS_UPSTREAM_KEY` | — | your real provider key |
 | `PORTCULLIS_ADMIN_TOKEN` | — | guards the teaching surface; **unset → 503** |
+| `PORTCULLIS_SCOPE_TOKENS` | — | `scope=token,…` — per-client isolation ([SCOPES.md](docs/SCOPES.md)) |
 | `PORTCULLIS_STORE` | `store.json` | learned terms, written `0600` |
 | `PORTCULLIS_MODEL` | — | named detector from the registry |
 | `PORTCULLIS_MODEL_DIR` | `./model` | detector directory |
@@ -334,8 +335,9 @@ no mock had caught.
 
 - **The store is not encrypted at rest.** It is `0600` and never leaves the machine, but
   it is plaintext JSON.
-- **`scope` is recorded but not enforced.** Every taught term applies to every request, so
-  there is no per-client isolation despite the schema implying it.
+- **Scope isolation is opt-in and is selection, not a boundary.** With per-client tokens
+  configured ([docs/SCOPES.md](docs/SCOPES.md)) each client only gets `global` terms plus its
+  own; without them every term applies to every request.
 - **Only an OpenAI-compatible provider has been exercised live.** The Anthropic
   `/v1/messages` path is mock-tested only.
 - **Detection serialises** behind one lock, so throughput is bounded (~3–4 scans/second on
@@ -354,7 +356,7 @@ All of these are stated in full, with reproduction steps, in
 | ✅ | **M2** — in-chat `teach` / `unteach` / `terms` / `suggestions` over HTTP, with cache invalidation and bearer auth |
 | ✅ | **M3** — SSE streaming with a placeholder-level carry buffer; the Anthropic Messages API; a per-client setup matrix |
 | ✅ | **M4** — packaging: Docker, compose, systemd, and a deployment guide |
-| | **M5** — per-client `scope` enforcement; demonstration of multi-tenant isolation |
+| ✅ | **M5** — per-client `scope` enforcement via per-client tokens; multi-tenant isolation demonstrated in `tests/scopes.rs` |
 | | **M6** — encryption at rest for the learned store |
 | | **M7** — metrics export (Prometheus/OTLP) |
 
@@ -366,6 +368,7 @@ All of these are stated in full, with reproduction steps, in
 | [OPERATIONS.md](docs/OPERATIONS.md) | timeouts, limits, health, logging, concurrency, and the remaining gaps |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | request lifecycle, diagrams, the component map |
 | [MODELS.md](docs/MODELS.md) | the detector registry, precedence, supported families |
+| [SCOPES.md](docs/SCOPES.md) | per-client isolation: tokens, what is and is not isolated |
 | [TEACHING.md](docs/TEACHING.md) | how the learning loop works, and what it does not do yet |
 | [EXAMPLE.md](docs/EXAMPLE.md) | a real before/after, including the learning loop |
 | [RESOURCES.md](docs/RESOURCES.md) | measured CPU, RAM, disk and latency |
