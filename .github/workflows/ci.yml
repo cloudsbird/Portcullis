@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  default:
+    name: default (no ML deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Test
+        run: cargo test --verbose
+
+      # The safety contract must hold without the ML stack present.
+      - name: The default build must NOT depend on ort
+        run: |
+          if cargo tree --edges normal --prefix none | grep -q '^ort '; then
+            echo "::error::ort must stay feature-gated (optional), not a default dependency"
+            exit 1
+          fi
+
+  onnx:
+    name: onnx feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # ort v2 default features pull native-TLS (openssl-sys) at build time.
+      - name: Install build deps for ort
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Build with the onnx feature
+        run: cargo build --features onnx --verbose
+
+      # The golden detector test skips gracefully when no model is present, so
+      # this still exercises the invariant + proxy suites.
+      - name: Test with the onnx feature
+        run: cargo test --features onnx --verbose
