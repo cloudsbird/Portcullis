@@ -3,6 +3,8 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::crypt::{self, StoreKey};
+
 fn default_scope() -> String {
     "global".into()
 }
@@ -47,12 +49,40 @@ pub struct Store {
 }
 
 impl Store {
+    /// Load the store, decrypting it with the key from `PORTCULLIS_STORE_KEY` or
+    /// `PORTCULLIS_STORE_KEY_FILE` when the file is encrypted.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with(path, StoreKey::from_env()?.as_ref())
+    }
+
+    /// [`Store::load`] with an explicit key.
+    ///
+    /// A plaintext file loads whether or not a key is given (so turning encryption on
+    /// is just setting the key; the next save encrypts it). An encrypted file without
+    /// the key is an error, never an empty store — silently starting empty would
+    /// overwrite the real one on the next teach.
+    pub fn load_with(path: impl AsRef<Path>, key: Option<&StoreKey>) -> Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
             return Ok(Store::default());
         }
-        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+        let bytes = std::fs::read(path)?;
+        if crypt::is_encrypted(&bytes) {
+            let key = key.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is encrypted: set PORTCULLIS_STORE_KEY or PORTCULLIS_STORE_KEY_FILE",
+                    path.display()
+                )
+            })?;
+            let plain = crypt::open(key, &bytes)?;
+            return Ok(serde_json::from_slice(&plain)?);
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Is the store at `path` encrypted? (`false` if it does not exist yet.)
+    pub fn is_encrypted(path: impl AsRef<Path>) -> bool {
+        std::fs::read(path).is_ok_and(|b| crypt::is_encrypted(&b))
     }
 
     /// Persist the store, atomically.
@@ -61,12 +91,24 @@ impl Store {
     /// renamed over the target, so a crash mid-write leaves the previous store
     /// intact instead of a truncated one. On Unix the file is created `0600`: it
     /// is a map of everything you consider private, and there is no encryption at
-    /// rest yet — so at minimum it must not be world-readable.
+    /// rest unless a key is configured — so at minimum it must not be world-readable.
+    ///
+    /// With `PORTCULLIS_STORE_KEY` / `PORTCULLIS_STORE_KEY_FILE` set the contents are
+    /// encrypted (see [`crate::crypt`]).
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.save_with(path, StoreKey::from_env()?.as_ref())
+    }
+
+    /// [`Store::save`] with an explicit key (`None`: plaintext).
+    pub fn save_with(&self, path: impl AsRef<Path>, key: Option<&StoreKey>) -> Result<()> {
         use std::io::Write;
 
         let path = path.as_ref();
-        let raw = serde_json::to_string_pretty(self)?;
+        let plain = serde_json::to_vec_pretty(self)?;
+        let raw = match key {
+            Some(key) => crypt::seal(key, &plain)?,
+            None => plain,
+        };
 
         let mut tmp_name = path
             .file_name()
@@ -85,7 +127,7 @@ impl Store {
 
         let write = || -> Result<()> {
             let mut file = options.open(&tmp)?;
-            file.write_all(raw.as_bytes())?;
+            file.write_all(&raw)?;
             file.sync_all()?;
             Ok(())
         };
@@ -244,6 +286,70 @@ mod tests {
         assert!(s.unteach_in("acme", Some("alpha")));
         assert_eq!(s.deny.len(), 1);
         assert_eq!(s.deny[0].scope, "beta");
+    }
+
+    fn cheap_key(pass: &str) -> StoreKey {
+        StoreKey::new(pass).with_params(crypt::KdfParams {
+            m_kib: 8,
+            t: 1,
+            p: 1,
+        })
+    }
+
+    #[test]
+    fn an_encrypted_store_round_trips_and_never_holds_plaintext_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+        let key = cheap_key("a long enough passphrase");
+
+        let mut store = Store::default();
+        store.teach("Cartalian", "ORG", "alpha");
+        store.save_with(&path, Some(&key)).unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("Cartalian") && !on_disk.contains("alpha"),
+            "{on_disk}"
+        );
+        assert!(Store::is_encrypted(&path));
+
+        let back = Store::load_with(&path, Some(&key)).unwrap();
+        assert_eq!(back.deny[0].term, "Cartalian");
+        assert_eq!(back.deny[0].scope, "alpha");
+    }
+
+    #[test]
+    fn an_encrypted_store_without_its_key_is_an_error_not_an_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+        let mut store = Store::default();
+        store.teach("Cartalian", "ORG", "global");
+        store
+            .save_with(&path, Some(&cheap_key("right key right key")))
+            .unwrap();
+
+        let err = Store::load_with(&path, None).unwrap_err().to_string();
+        assert!(err.contains("encrypted"), "{err}");
+        let err = Store::load_with(&path, Some(&cheap_key("wrong key wrong key")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("wrong key"), "{err}");
+    }
+
+    #[test]
+    fn a_plaintext_store_migrates_when_a_key_is_first_supplied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+        let mut store = Store::default();
+        store.teach("Cartalian", "ORG", "global");
+        store.save_with(&path, None).unwrap();
+        assert!(!Store::is_encrypted(&path));
+
+        let key = cheap_key("fresh key fresh key");
+        let loaded = Store::load_with(&path, Some(&key)).unwrap();
+        loaded.save_with(&path, Some(&key)).unwrap();
+        assert!(Store::is_encrypted(&path));
+        assert_eq!(Store::load_with(&path, Some(&key)).unwrap().deny.len(), 1);
     }
 
     #[test]

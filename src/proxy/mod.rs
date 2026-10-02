@@ -366,6 +366,7 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
         forward_headers = ?state.forward_headers,
         extra_upstream_headers = state.extra_upstream_headers.len(),
         admin_api = state.admin_token.is_some(),
+        store_encrypted = crate::Store::is_encrypted(state.store_path.as_deref().unwrap_or("store.json")),
         scopes = state.scope_tokens.len(),
         "portcullis listening"
     );

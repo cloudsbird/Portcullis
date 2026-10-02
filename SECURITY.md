@@ -61,8 +61,11 @@ These are known, documented limitations rather than vulnerabilities — see
 - **Values the detector does not recognise.** Detection is best-effort; the guarantee
   comes from what you teach it, not from the model. A missed detection in novel text is
   expected behaviour, and `teach` is the remedy.
-- **The store is not encrypted at rest.** Documented, and on the roadmap.
-- **`scope` is not enforced.** Documented; every term currently applies globally.
+- **The store is encrypted only if you set a key** (`PORTCULLIS_STORE_KEY_FILE`); otherwise
+  it is `0600` plaintext. See [docs/ENCRYPTION.md](docs/ENCRYPTION.md) for what that does
+  and does not cover.
+- **`scope` isolation is opt-in** and is selection, not a security boundary against the
+  operator. See [docs/SCOPES.md](docs/SCOPES.md).
 - **The proxy endpoints are unauthenticated by design**, for loopback use. Exposing them
   without fronting authentication is a deployment decision, not a defect.
 - **Metadata** — timing, request volume, and the fact that redaction is happening.

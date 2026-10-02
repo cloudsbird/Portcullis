@@ -60,6 +60,11 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: String,
     },
+    /// Encrypt the store file in place (needs PORTCULLIS_STORE_KEY or _KEY_FILE).
+    EncryptStore,
+    /// Write the store back as plaintext. Explicit, for key rotation or turning
+    /// encryption off: decrypt with the old key, then run `encrypt-store` with the new.
+    DecryptStore,
     /// List the detectors available in the model registry.
     Models,
     /// Run the ONNX detector over JSONL on stdin, emitting JSONL on stdout.
@@ -85,6 +90,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing();
     let command = cli.command;
+
+    // The store commands need the file and a key, nothing else — no detector load.
+    match command {
+        Command::EncryptStore => return encrypt_store(&cli.store),
+        Command::DecryptStore => return decrypt_store(&cli.store),
+        _ => {}
+    }
 
     // `models` only needs the registry, not a loaded detector.
     if matches!(command, Command::Models) {
@@ -135,7 +147,7 @@ async fn main() -> Result<()> {
             let gw = Gateway::with_settings(Store::load(&cli.store)?, &settings);
             portcullis::proxy::serve(gw, &bind).await?;
         }
-        Command::Models => {}
+        Command::Models | Command::EncryptStore | Command::DecryptStore => {}
         #[cfg(feature = "onnx")]
         Command::Detect { labels, threshold } => {
             run_detect(&settings, labels, threshold)?;
@@ -167,6 +179,38 @@ fn init_tracing() {
     } else {
         let _ = builder.try_init();
     }
+}
+
+fn require_key() -> Result<portcullis::StoreKey> {
+    portcullis::StoreKey::from_env()?.ok_or_else(|| {
+        anyhow::anyhow!("no key: set PORTCULLIS_STORE_KEY or PORTCULLIS_STORE_KEY_FILE")
+    })
+}
+
+fn encrypt_store(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!("no store at {}", path.display());
+    }
+    let key = require_key()?;
+    let store = Store::load_with(path, Some(&key))?;
+    store.save_with(path, Some(&key))?;
+    println!("encrypted: {} ({} terms)", path.display(), store.deny.len());
+    Ok(())
+}
+
+fn decrypt_store(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!("no store at {}", path.display());
+    }
+    let key = require_key()?;
+    let store = Store::load_with(path, Some(&key))?;
+    store.save_with(path, None)?;
+    println!(
+        "decrypted: {} is now PLAINTEXT ({} terms). Protect or re-encrypt it.",
+        path.display(),
+        store.deny.len()
+    );
+    Ok(())
 }
 
 /// Print the detectors available in the registry, and how to select one.

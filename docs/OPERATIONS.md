@@ -153,8 +153,9 @@ What is **not** closed, and I would not pretend otherwise:
 1. **Only one provider has been exercised.** The live run covers an OpenAI-compatible
    endpoint. The Anthropic `/v1/messages` path is still mock-only — no live Anthropic key
    was available. Its SSE shapes are different, so treat it as unverified against reality.
-2. **The store is not encrypted at rest.** It is `0600` on disk, and gitignored, but it is
-   plaintext JSON: a map of everything you consider private.
+2. **The store is encrypted only if you set a key.** Without one it is `0600` plaintext JSON,
+   a map of everything you consider private. With one see [ENCRYPTION.md](ENCRYPTION.md) —
+   the running process still holds it decrypted.
 3. **Scope isolation is opt-in, and is selection, not a security boundary.** See
    [SCOPES.md](SCOPES.md): per-client tokens pick which terms apply, but the operator,
    the store file, the provider key and the detector are shared.

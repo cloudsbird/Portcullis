@@ -185,7 +185,7 @@ Being precise here matters more than looking complete.
 | Not done | Detail |
 |---|---|
 | **Retrain anything** | By design. No model weights change; teaching is a list append. |
-| **Encrypt the store** | `store.json` is **plaintext JSON** on disk today. Protect it with filesystem permissions, and keep it off version control. |
+| **Force encryption** | Encryption at rest is opt-in: set `PORTCULLIS_STORE_KEY_FILE` ([ENCRYPTION.md](ENCRYPTION.md)). Without a key `store.json` is plaintext JSON — protect it with filesystem permissions and keep it off version control. |
 | **Isolate clients by default** | `scope` is enforced only when you configure per-client tokens — see [SCOPES.md](SCOPES.md). Without them, every taught term applies to every request. |
 | **Populate `aliases`** | The lookup honours aliases, but nothing can add one — `teach` always writes an empty list, and there is no CLI/HTTP surface for it. Teach each spelling for now. |
 | **Catch variants automatically** | `Aerolith` and `Aerolith Inc.` are different strings. Teach both, or wait for fuzzy expansion (below). |
@@ -203,7 +203,7 @@ Being precise here matters more than looking complete.
 | Re-teach updates a label | ✅ implemented |
 | `scope` enforcement | ✅ opt-in via per-client tokens ([SCOPES.md](SCOPES.md)) |
 | `aliases` API | ❌ plumbing only |
-| Store encryption at rest | ❌ plaintext |
+| Store encryption at rest | ✅ opt-in, Argon2id + AES-256-GCM ([ENCRYPTION.md](ENCRYPTION.md)) |
 | Embedding expansion / fine-tuning | ❌ not started |
 
 The honest summary: **the guarantee layer works today; the convenience layers are

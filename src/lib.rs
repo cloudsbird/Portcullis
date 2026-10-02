@@ -13,6 +13,7 @@
 //!    term taught mid-session cannot be leaked by a stale cached redaction.
 //! 4. **Fail closed** — the assembled payload is asserted clean before it leaves.
 
+pub mod crypt;
 pub mod detect;
 #[cfg(feature = "onnx")]
 pub mod detect_onnx;
@@ -22,6 +23,7 @@ pub mod proxy;
 pub mod store;
 pub mod vault;
 
+pub use crypt::StoreKey;
 pub use model::DetectorSettings;
 pub use pipeline::Gateway;
 pub use store::{applies, Entry, HiddenForm, Store, GLOBAL_SCOPE};

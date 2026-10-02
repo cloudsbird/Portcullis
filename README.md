@@ -59,9 +59,10 @@ LAN or public interface is a security decision, not a configuration detail — p
 authentication in front of it first. See
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#exposing-it-beyond-loopback).
 
-**The learned store is plaintext.** It is written `0600`, gitignored, and never leaves
-the machine — but it is a map of everything you consider private, and it is not encrypted
-at rest yet. Treat it as a secret.
+**The learned store is plaintext unless you set a key.** It is written `0600`, gitignored,
+and never leaves the machine — but it is a map of everything you consider private. Set
+`PORTCULLIS_STORE_KEY_FILE` to encrypt it at rest (Argon2id + AES-256-GCM); see
+[docs/ENCRYPTION.md](docs/ENCRYPTION.md). Either way, treat it as a secret.
 
 **What it does not protect against.** Prompt injection that convinces the model to reveal
 a placeholder verbatim, values the detector never recognises, and metadata (timing,
@@ -246,6 +247,7 @@ Everything is environment variables. The ones that matter most:
 | `PORTCULLIS_ADMIN_TOKEN` | — | guards the teaching surface; **unset → 503** |
 | `PORTCULLIS_SCOPE_TOKENS` | — | `scope=token,…` — per-client isolation ([SCOPES.md](docs/SCOPES.md)) |
 | `PORTCULLIS_STORE` | `store.json` | learned terms, written `0600` |
+| `PORTCULLIS_STORE_KEY_FILE` | — | passphrase file that encrypts the store at rest ([ENCRYPTION.md](docs/ENCRYPTION.md)); `PORTCULLIS_STORE_KEY` for inline |
 | `PORTCULLIS_MODEL` | — | named detector from the registry |
 | `PORTCULLIS_MODEL_DIR` | `./model` | detector directory |
 | `PORTCULLIS_THRESHOLD` | `0.5` | detector confidence cut-off |
@@ -333,8 +335,9 @@ no mock had caught.
 
 **Not ready to guard someone else's data yet:**
 
-- **The store is not encrypted at rest.** It is `0600` and never leaves the machine, but
-  it is plaintext JSON.
+- **The store is encrypted at rest only if you set a key.** Without one it is `0600` plaintext
+  JSON. With one, a running process still holds it decrypted in memory
+  ([docs/ENCRYPTION.md](docs/ENCRYPTION.md)).
 - **Scope isolation is opt-in and is selection, not a boundary.** With per-client tokens
   configured ([docs/SCOPES.md](docs/SCOPES.md)) each client only gets `global` terms plus its
   own; without them every term applies to every request.
@@ -357,7 +360,7 @@ All of these are stated in full, with reproduction steps, in
 | ✅ | **M3** — SSE streaming with a placeholder-level carry buffer; the Anthropic Messages API; a per-client setup matrix |
 | ✅ | **M4** — packaging: Docker, compose, systemd, and a deployment guide |
 | ✅ | **M5** — per-client `scope` enforcement via per-client tokens; multi-tenant isolation demonstrated in `tests/scopes.rs` |
-| | **M6** — encryption at rest for the learned store |
+| ✅ | **M6** — encryption at rest for the learned store (Argon2id + AES-256-GCM, opt-in) |
 | | **M7** — metrics export (Prometheus/OTLP) |
 
 ## Documentation
@@ -369,6 +372,7 @@ All of these are stated in full, with reproduction steps, in
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | request lifecycle, diagrams, the component map |
 | [MODELS.md](docs/MODELS.md) | the detector registry, precedence, supported families |
 | [SCOPES.md](docs/SCOPES.md) | per-client isolation: tokens, what is and is not isolated |
+| [ENCRYPTION.md](docs/ENCRYPTION.md) | encrypting the store: setup, format, rotation, limits |
 | [TEACHING.md](docs/TEACHING.md) | how the learning loop works, and what it does not do yet |
 | [EXAMPLE.md](docs/EXAMPLE.md) | a real before/after, including the learning loop |
 | [RESOURCES.md](docs/RESOURCES.md) | measured CPU, RAM, disk and latency |

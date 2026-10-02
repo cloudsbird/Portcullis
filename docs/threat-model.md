@@ -12,7 +12,7 @@ locally in the response.
 effectively, a list of everything you consider private. Therefore:
 
 - it is **`.gitignore`d** and must never be committed
-- it must be **encrypted at rest** (M1) and access-controlled
+- it should be **encrypted at rest** ([ENCRYPTION.md](ENCRYPTION.md)) and access-controlled
 - it must **never be synced** anywhere
 
 The in-memory delta cache stores `sha256(original) -> redacted`; it holds **no raw
