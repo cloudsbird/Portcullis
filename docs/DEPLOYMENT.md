@@ -309,7 +309,9 @@ journalctl -u portcullis -f
 
 ---
 
-## Exposing it beyond loopback — read this first
+## Exposing it beyond loopback
+
+Your client is meant to be on the same machine. Read this before changing that.
 
 > ### ⚠️ The `/v1/chat/completions` and `/v1/messages` routes have **no authentication**.
 >
