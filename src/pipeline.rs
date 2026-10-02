@@ -53,7 +53,7 @@ impl Gateway {
         {
             match crate::detect_onnx::OnnxDetector::from_env() {
                 Ok(detector) => gw = gw.with_detector(Box::new(detector)),
-                Err(e) => eprintln!("portcullis: ONNX detector disabled ({e})"),
+                Err(e) => tracing::warn!("ONNX detector disabled ({e})"),
             }
         }
         gw
@@ -85,7 +85,7 @@ impl Gateway {
                         .as_deref()
                         .map(|n| format!(" [model '{n}']"))
                         .unwrap_or_default();
-                    eprintln!("portcullis: detector disabled ({e}){which}");
+                    tracing::warn!("detector disabled ({e}){which}");
                 }
             }
         }
@@ -127,7 +127,12 @@ impl Gateway {
     /// Teach a term. **Invalidates the delta cache** (invariant 3): a cached redaction
     /// predates this term and would otherwise leak it in old segments forever.
     pub fn teach(&mut self, term: &str, label: &str, scope: &str) {
-        self.store.teach(term, label, scope);
+        self.teach_with(term, label, scope, false);
+    }
+
+    /// Like [`Gateway::teach`], choosing whether the term only matches as a whole word.
+    pub fn teach_with(&mut self, term: &str, label: &str, scope: &str, whole_word: bool) {
+        self.store.teach_with(term, label, scope, whole_word);
         self.cache.clear();
     }
 
@@ -146,11 +151,8 @@ impl Gateway {
     }
 
     /// Redact one segment: deterministic dictionary first, then builtin patterns.
-    fn redact_segment(&mut self, seg: &str) -> String {
-        let mut spans = {
-            let dict = DictionaryDetector::new(&self.store);
-            dict.detect(seg)
-        };
+    fn redact_segment(&mut self, dict: &DictionaryDetector, seg: &str) -> String {
+        let mut spans = dict.detect(seg);
         spans.extend(self.regexes.detect(seg));
         if let Some(extra) = &self.extra {
             spans.extend(extra.detect(seg));
@@ -187,6 +189,8 @@ impl Gateway {
     /// Invariant 1: a cache hit re-emits the **redacted** form, never the raw input.
     /// Invariant 2: every segment passes through here — there is no bypass path.
     pub fn process(&mut self, segments: &[String]) -> Vec<String> {
+        // Compiled once per call, and only if some segment misses the cache.
+        let mut dict: Option<DictionaryDetector> = None;
         segments
             .iter()
             .map(|seg| {
@@ -194,7 +198,8 @@ impl Gateway {
                 match self.cache.get(&h).cloned() {
                     Some(redacted) => redacted,
                     None => {
-                        let redacted = self.redact_segment(seg);
+                        let dict = dict.get_or_insert_with(|| DictionaryDetector::new(&self.store));
+                        let redacted = self.redact_segment(dict, seg);
                         self.cache.insert(h, redacted.clone());
                         redacted
                     }
@@ -205,13 +210,11 @@ impl Gateway {
 
     /// Invariant 4: fail-closed outbound assertion (cheap; no model).
     pub fn assert_clean(&self, outbound: &[String]) -> Result<(), String> {
+        let dict = DictionaryDetector::new(&self.store);
         for seg in outbound {
-            for (form, _) in self.store.hidden_forms() {
-                if self.store.is_allowed(&form) {
-                    continue;
-                }
-                if seg.to_lowercase().contains(&form.to_lowercase()) {
-                    return Err(format!("residual protected term in outbound: {form}"));
+            for span in dict.detect(seg) {
+                if !self.store.is_allowed(&seg[span.start..span.end]) {
+                    return Err("residual protected term in outbound".into());
                 }
             }
             if seg.contains("<<") && !seg.contains(">>") {

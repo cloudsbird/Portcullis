@@ -82,6 +82,7 @@ fn allow_list_wins() {
         scope: "global".into(),
         aliases: vec![],
         source: "user".into(),
+        whole_word: false,
     });
     let mut gw = Gateway::new(s);
     let out = gw.process(&["Adit pinged us.".to_string()]);
@@ -103,4 +104,49 @@ fn rehydrate_round_trip() {
     let out = gw.process(&["Cartalian is our client.".to_string()]);
     let restored = gw.rehydrate(&out[0]);
     assert_eq!(restored, "Cartalian is our client.");
+}
+
+/// Offsets must come from the original text. `İ` lowercases to a *longer* byte
+/// sequence, so reusing offsets from a lowercased copy slices mid-character
+/// (panic) or lands on the wrong bytes (leak).
+#[test]
+fn unicode_case_mapping_cannot_shift_spans() {
+    let mut gw = gw_with(&[("Cartalian", "ORG")]);
+    let text = "İİİİİ met Cartalian, then CARTALIAN again.".to_string();
+    let out = gw.process(std::slice::from_ref(&text));
+    assert!(!out[0].to_lowercase().contains("cartalian"), "{}", out[0]);
+    assert!(out[0].starts_with("İİİİİ met "), "{}", out[0]);
+    assert!(gw.assert_clean(&out).is_ok());
+}
+
+#[test]
+fn substring_matching_is_the_safe_default() {
+    let mut gw = gw_with(&[("Ann", "PERSON")]);
+    let out = gw.process(&["Anna and Ann.".to_string()]);
+    assert!(
+        !out[0].contains("Ann"),
+        "default must over-redact: {}",
+        out[0]
+    );
+}
+
+#[test]
+fn whole_word_terms_leave_longer_words_alone() {
+    let mut s = Store::default();
+    s.teach_with("Ann", "PERSON", "global", true);
+    let mut gw = Gateway::new(s);
+    let out = gw.process(&["Anna wrote to Ann, not channel.".to_string()]);
+    assert!(out[0].contains("Anna"), "{}", out[0]);
+    assert!(out[0].contains("channel"), "{}", out[0]);
+    assert!(!out[0].contains("to Ann,"), "{}", out[0]);
+    // The outbound assertion honours the same boundaries (no false alarm on "Anna").
+    assert!(gw.assert_clean(&out).is_ok());
+    assert!(gw.assert_clean(&["Ann is here".to_string()]).is_err());
+}
+
+#[test]
+fn longest_form_wins_at_the_same_position() {
+    let mut gw = gw_with(&[("Project", "ORG"), ("Project Loki", "PROJECT")]);
+    let out = gw.process(&["About Project Loki today.".to_string()]);
+    assert!(out[0].contains("<<PROJECT_1>>"), "{}", out[0]);
 }

@@ -1,6 +1,8 @@
-use regex::Regex;
+use std::collections::HashMap;
 
-use crate::store::Store;
+use regex::{Regex, RegexBuilder};
+
+use crate::store::{HiddenForm, Store};
 
 /// A detected sensitive span.
 #[derive(Debug, Clone, PartialEq)]
@@ -22,37 +24,122 @@ pub trait Detector: Send + Sync {
 }
 
 /// Deterministic dictionary layer — the **guarantee**. Runs first, always.
-pub struct DictionaryDetector<'a> {
-    store: &'a Store,
+///
+/// All forms are compiled into one case-insensitive alternation, so a scan is a
+/// single pass over the text. Matching runs on the *original* text, so span
+/// offsets are always valid char boundaries — lowercasing a copy and reusing its
+/// offsets is wrong for characters whose case mapping changes byte length.
+pub struct DictionaryDetector {
+    regex: Option<Regex>,
+    /// `lowercased form -> label`, used to name a match without a group scan.
+    labels: HashMap<String, String>,
+    /// Labels in alternation order, the fallback when the map misses.
+    ordered: Vec<String>,
 }
 
-impl<'a> DictionaryDetector<'a> {
-    pub fn new(store: &'a Store) -> Self {
-        Self { store }
+impl DictionaryDetector {
+    pub fn new(store: &Store) -> Self {
+        let mut forms: Vec<HiddenForm> = store
+            .hidden_entries()
+            .into_iter()
+            .filter(|h| !h.form.is_empty())
+            .collect();
+        // Longest first, so at one start position the longest form wins.
+        forms.sort_by_key(|h| std::cmp::Reverse(h.form.len()));
+
+        // De-duplicate by lowercased form. A non-whole-word entry is the stricter
+        // protection, so it wins over a whole-word duplicate.
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut kept: Vec<HiddenForm> = Vec::new();
+        for h in forms {
+            let key = h.form.to_lowercase();
+            match seen.get(&key) {
+                Some(&i) => {
+                    if kept[i].whole_word && !h.whole_word {
+                        kept[i] = h;
+                    }
+                }
+                None => {
+                    seen.insert(key, kept.len());
+                    kept.push(h);
+                }
+            }
+        }
+
+        if kept.is_empty() {
+            return Self {
+                regex: None,
+                labels: HashMap::new(),
+                ordered: Vec::new(),
+            };
+        }
+
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let alternatives: Vec<String> = kept
+            .iter()
+            .map(|h| {
+                // `\b` only means something next to a word character.
+                let edge = |c: Option<char>| {
+                    if h.whole_word && c.is_some_and(is_word) {
+                        r"\b"
+                    } else {
+                        ""
+                    }
+                };
+                let lead = edge(h.form.chars().next());
+                let trail = edge(h.form.chars().next_back());
+                format!("({lead}{}{trail})", regex::escape(&h.form))
+            })
+            .collect();
+
+        let regex = RegexBuilder::new(&alternatives.join("|"))
+            .case_insensitive(true)
+            // Escaped literals cannot be invalid; only an absurd number of terms
+            // could exceed this, and that must fail loudly rather than silently
+            // disable the guarantee.
+            .size_limit(256 << 20)
+            .build()
+            .expect("escaped dictionary terms form a valid regex");
+
+        let labels = kept
+            .iter()
+            .map(|h| (h.form.to_lowercase(), h.label.clone()))
+            .collect();
+        let ordered = kept.into_iter().map(|h| h.label).collect();
+        Self {
+            regex: Some(regex),
+            labels,
+            ordered,
+        }
     }
 }
 
-impl Detector for DictionaryDetector<'_> {
+impl Detector for DictionaryDetector {
     fn detect(&self, text: &str) -> Vec<Span> {
+        let Some(regex) = &self.regex else {
+            return Vec::new();
+        };
         let mut spans = Vec::new();
-        let lower = text.to_lowercase();
-        for (form, label) in self.store.hidden_forms() {
-            let needle = form.to_lowercase();
-            if needle.is_empty() {
-                continue;
-            }
-            let mut from = 0usize;
-            while let Some(idx) = lower[from..].find(&needle) {
-                let start = from + idx;
-                let end = start + needle.len();
+        for caps in regex.captures_iter(text) {
+            let m = caps.get(0).expect("group 0 always participates");
+            let label = self
+                .labels
+                .get(&m.as_str().to_lowercase())
+                .cloned()
+                .or_else(|| {
+                    // Case folding can match text whose lowercase differs from the form.
+                    (1..caps.len())
+                        .find(|&i| caps.get(i).is_some())
+                        .map(|i| self.ordered[i - 1].clone())
+                });
+            if let Some(label) = label {
                 spans.push(Span {
-                    start,
-                    end,
-                    label: label.clone(),
+                    start: m.start(),
+                    end: m.end(),
+                    label,
                     source: "dictionary",
                     score: 0.0,
                 });
-                from = end.max(start + 1);
             }
         }
         spans

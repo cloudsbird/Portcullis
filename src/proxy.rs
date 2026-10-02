@@ -1230,6 +1230,9 @@ struct TeachRequest {
     label: String,
     #[serde(default = "default_scope")]
     scope: String,
+    /// Match only at word boundaries.
+    #[serde(default)]
+    whole_word: bool,
 }
 
 #[derive(Deserialize)]
@@ -1307,7 +1310,7 @@ async fn teach_handler(
 
     let path = store_path(&state);
     let mut gw = state.gateway.lock().await;
-    gw.teach(&req.term, &req.label, &req.scope);
+    gw.teach_with(&req.term, &req.label, &req.scope, req.whole_word);
     if let Err(e) = gw.store.save(&path) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }

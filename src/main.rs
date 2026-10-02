@@ -43,6 +43,9 @@ enum Command {
         term: String,
         #[arg(long, default_value = "ORG")]
         label: String,
+        /// Match only at word boundaries (so "Ann" leaves "Anna" alone).
+        #[arg(long)]
+        whole_word: bool,
     },
     /// Remove a taught term.
     Unteach { term: String },
@@ -96,9 +99,13 @@ async fn main() -> Result<()> {
     // Each arm builds only what it needs, so `detect` does not pay for a Gateway
     // (which would load the ONNX model a second time).
     match command {
-        Command::Teach { term, label } => {
+        Command::Teach {
+            term,
+            label,
+            whole_word,
+        } => {
             let mut gw = Gateway::with_settings(Store::load(&cli.store)?, &settings);
-            gw.teach(&term, &label, "global");
+            gw.teach_with(&term, &label, "global", whole_word);
             gw.store.save(&cli.store)?;
             println!("taught: {term} ({label})");
         }
