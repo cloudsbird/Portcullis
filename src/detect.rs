@@ -146,23 +146,74 @@ impl Detector for DictionaryDetector {
     }
 }
 
-/// Builtin structured patterns (emails, phones, cards, IPs). Cheap, deterministic.
+/// `Some(false)`-style gate run on a regex hit before it becomes a span.
+type Validator = fn(&str) -> bool;
+
 pub struct RegexDetector {
-    patterns: Vec<(Regex, &'static str)>,
+    patterns: Vec<(Regex, &'static str, Option<Validator>)>,
+}
+
+fn digits(s: &str) -> impl Iterator<Item = u32> + '_ {
+    s.chars().filter_map(|c| c.to_digit(10))
+}
+
+/// Luhn checksum over the digits of `s`, with the usual 13–19 digit card length.
+fn luhn_valid(s: &str) -> bool {
+    let ds: Vec<u32> = digits(s).collect();
+    if !(13..=19).contains(&ds.len()) {
+        return false;
+    }
+    let sum: u32 = ds
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, &d)| {
+            if i % 2 == 1 {
+                let x = d * 2;
+                if x > 9 {
+                    x - 9
+                } else {
+                    x
+                }
+            } else {
+                d
+            }
+        })
+        .sum();
+    sum.is_multiple_of(10)
+}
+
+/// A phone-shaped run needs enough digits to be a number at all, and an ISO date
+/// (`2026-10-02`) is not one.
+fn plausible_phone(s: &str) -> bool {
+    let n = digits(s).count();
+    if n < 7 {
+        return false;
+    }
+    let b = s.as_bytes();
+    let iso_date = b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        });
+    !iso_date
 }
 
 impl RegexDetector {
     pub fn new() -> Self {
-        let defs: &[(&str, &str)] = &[
-            (r"[\w.+-]+@[\w-]+\.[\w.-]+", "EMAIL"),
-            (r"\+?\d[\d\s().-]{6,}\d", "PHONE"),
-            (r"\b(?:\d[ -]*?){13,16}\b", "CARD"),
-            (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "IP"),
+        // Order matters for ties: at the same start and length, the earlier pattern
+        // wins in `merge`, so the more specific label goes first. A card that fails
+        // Luhn is still caught as a PHONE-shaped run, so validation never lowers recall.
+        let defs: &[(&str, &str, Option<Validator>)] = &[
+            (r"[\w.+-]+@[\w-]+\.[\w.-]+", "EMAIL", None),
+            (r"\b(?:\d[ -]?){12,18}\d\b", "CARD", Some(luhn_valid)),
+            (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "IP", None),
+            (r"\+?\d[\d\s().-]{6,}\d", "PHONE", Some(plausible_phone)),
         ];
         Self {
             patterns: defs
                 .iter()
-                .map(|(p, l)| (Regex::new(p).unwrap(), *l))
+                .map(|(p, l, v)| (Regex::new(p).expect("builtin pattern is valid"), *l, *v))
                 .collect(),
         }
     }
@@ -177,8 +228,11 @@ impl Default for RegexDetector {
 impl Detector for RegexDetector {
     fn detect(&self, text: &str) -> Vec<Span> {
         let mut spans = Vec::new();
-        for (re, label) in &self.patterns {
+        for (re, label, validator) in &self.patterns {
             for m in re.find_iter(text) {
+                if validator.is_some_and(|ok| !ok(m.as_str())) {
+                    continue;
+                }
                 spans.push(Span {
                     start: m.start(),
                     end: m.end(),
@@ -221,4 +275,48 @@ pub fn merge(mut spans: Vec<Span>) -> Vec<Span> {
         out.push(s);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labels(text: &str) -> Vec<(String, String)> {
+        merge(RegexDetector::new().detect(text))
+            .into_iter()
+            .map(|s| (s.label, text[s.start..s.end].to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn valid_card_is_labelled_card() {
+        let got = labels("pay 4111 1111 1111 1111 today");
+        assert!(
+            got.contains(&("CARD".into(), "4111 1111 1111 1111".into())),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn card_that_fails_luhn_is_still_redacted_as_a_number() {
+        let got = labels("pay 4111 1111 1111 1112 today");
+        assert!(got.iter().any(|(l, _)| l == "PHONE"), "{got:?}");
+    }
+
+    #[test]
+    fn dates_and_short_digit_runs_are_not_phones() {
+        assert!(labels("released 2026-10-02.").is_empty());
+        assert!(labels("see 1.........9").is_empty());
+    }
+
+    #[test]
+    fn real_phones_and_ips_are_kept() {
+        assert!(labels("call +1 (415) 555-0132")
+            .iter()
+            .any(|(l, _)| l == "PHONE"));
+        assert_eq!(
+            labels("host 192.168.10.4"),
+            vec![("IP".into(), "192.168.10.4".into())]
+        );
+    }
 }

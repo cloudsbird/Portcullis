@@ -244,9 +244,10 @@ fn collect_message_texts(msg: &mut Value, out: &mut Vec<String>) {
         collect_tool_calls_texts(tool_calls, out);
     }
 
-    // `name` and `tool_call_id` are identifiers. They are intentionally
-    // preserved as-is rather than redacted.
-    // TODO: consider whether identifier-like fields should be redacted.
+    // `name` and `tool_call_id` are protocol identifiers the provider matches on, so
+    // they are forwarded unchanged rather than replaced with placeholders. They are
+    // still covered by the fail-closed assertion over the whole outbound body: a
+    // taught term appearing in one stops the request instead of leaving the machine.
 }
 
 fn collect_content_texts(content: &mut Value, out: &mut Vec<String>) {

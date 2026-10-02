@@ -474,7 +474,9 @@ fn run_encoder(
 ) -> Result<Array3<f32>> {
     let ids = Tensor::from_array(input_ids)?;
     let mask = Tensor::from_array(attention_mask)?;
-    let mut session = encoder.lock().unwrap();
+    let mut session = encoder
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let outputs = session.run(ort::inputs![
         ONNX_INPUT_IDS => ids,
         ONNX_ATTENTION_MASK => mask
@@ -500,7 +502,9 @@ fn run_span_rep(
         token_span_end.to_vec(),
     )?)?;
 
-    let mut session = span_rep.lock().unwrap();
+    let mut session = span_rep
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let outputs = session.run(ort::inputs![
         ONNX_HIDDEN_STATES => hidden,
         ONNX_SPAN_START_IDX => span_start,
@@ -519,7 +523,9 @@ fn compute_scores(
     label_embeddings: &Array2<f32>,
 ) -> Result<Array2<f32>> {
     let labels_in = Tensor::from_array(label_embeddings.clone())?;
-    let mut session = count_embed.lock().unwrap();
+    let mut session = count_embed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let outputs = session.run(ort::inputs![ONNX_LABEL_EMBEDDINGS => labels_in])?;
     let transformed = outputs[0].try_extract_array::<f32>()?.to_owned();
     let labels_2d = transformed.into_dimensionality::<Ix2>()?;
