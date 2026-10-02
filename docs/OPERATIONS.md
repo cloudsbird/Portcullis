@@ -49,6 +49,20 @@ generate twice.
 Detection cost grows with input length (measured ≈ O(L^1.3)), so an unbounded body is an
 easy way to stall the gateway. Oversized requests get **413** before any work is done.
 
+## Providers that need their own headers
+
+Some providers require a project, tenant or session header on every call. There are two
+ways to supply it, and **nothing is forwarded unless you ask** — an unrelated credential
+cannot ride along.
+
+```bash
+# static: same value on every upstream request
+PORTCULLIS_UPSTREAM_HEADERS='{"x-opencode-session":"portcullis-1"}'
+
+# pass-through: forward this header from the incoming client request
+PORTCULLIS_FORWARD_HEADERS='x-opencode-session'
+```
+
 ## Logging
 
 | Variable | Default | Meaning |
@@ -113,6 +127,8 @@ it an open redaction proxy for your provider key.
 | `PORTCULLIS_LABELS` | detector default | comma-separated label set |
 | `PORTCULLIS_THRESHOLD` | `0.5` | detector confidence cut-off |
 | `PORTCULLIS_MAX_BODY_BYTES` | `2097152` | request body cap |
+| `PORTCULLIS_FORWARD_HEADERS` | — | comma-separated **client** headers to pass upstream (opt-in allowlist) |
+| `PORTCULLIS_UPSTREAM_HEADERS` | — | JSON object of static headers added to every upstream request |
 | `PORTCULLIS_CONNECT_TIMEOUT_SECS` | `10` | see above |
 | `PORTCULLIS_READ_TIMEOUT_SECS` | `180` | see above |
 | `PORTCULLIS_REQUEST_TIMEOUT_SECS` | `600` | see above |
@@ -133,12 +149,40 @@ What is closed:
 
 What is **not** closed, and I would not pretend otherwise:
 
-1. **Never exercised against a live provider.** Every test uses a mock upstream. Real
-   streaming behaviour — chunk timing, keep-alives, mid-stream error frames — is untested.
-   Run it against your own traffic in observe-only mode for a while before trusting it.
+1. **Only one provider has been exercised.** The live run covers an OpenAI-compatible
+   endpoint. The Anthropic `/v1/messages` path is still mock-only — no live Anthropic key
+   was available. Its SSE shapes are different, so treat it as unverified against reality.
 2. **The store is not encrypted at rest.** It is `0600` on disk, and gitignored, but it is
    plaintext JSON: a map of everything you consider private.
 3. **`scope` is recorded but not enforced.** Every taught term applies to every request,
    so there is no per-client isolation despite the schema implying it.
 4. **Detection serialises** (see Concurrency), so throughput is bounded.
 5. **No metrics/tracing export** — logs only, no Prometheus/OTLP.
+
+## Live end-to-end test
+
+`scripts/e2e_live.sh` runs the whole path against a **real** provider: real TLS, real auth,
+real SSE framing, real error shapes. It is opt-in, because it sends traffic to a third
+party and costs a fraction of a cent:
+
+```bash
+PORTCULLIS_E2E_UPSTREAM_URL=https://api.openai.com/v1/chat/completions \
+PORTCULLIS_E2E_UPSTREAM_KEY=sk-... \
+PORTCULLIS_E2E_MODEL=gpt-4o-mini \
+  scripts/e2e_live.sh
+```
+
+It asserts: health, the teach surface, a non-streaming round trip, a **streaming** round
+trip (frames, `[DONE]`, rehydration, and no leaked or half-split placeholder), that the
+provider received a **placeholder rather than the real value**, and that an upstream error
+surfaces as a status rather than a hang.
+
+**It earned its keep.** The first live run found two real gaps that no mock had caught:
+
+- **`reasoning_content` was not rehydrated.** Reasoning models stream a second text field;
+  a placeholder the model *reasoned* about came back to the client as a literal
+  `<<ORG_1>>`. Fixed for both the streaming and non-streaming paths (and non-streaming
+  tool-call arguments, which were also unhandled).
+- **Custom provider headers were impossible.** The proxy forwarded nothing from the client,
+  so any provider requiring a header (e.g. `x-opencode-session`) simply could not be
+  reached. Fixed with the opt-in allowlist above.

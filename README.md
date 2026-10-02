@@ -110,10 +110,15 @@ timeouts (with streaming handled separately), a request-body cap, an unauthentic
 `/healthz` that leaks nothing, detection moved off the async worker thread, structured
 logs that never contain prompt content, and a store written `0600`.
 
-**What is still missing before this should guard someone else's data:** it has never been
-exercised against a live provider (every test uses a mock upstream), the store is not
-encrypted at rest, and `scope` is recorded but not enforced. Those are stated in full in
-[`docs/OPERATIONS.md`](docs/OPERATIONS.md#before-this-guards-someone-elses-data).
+**What is still missing before this should guard someone else's data:** the store is not
+encrypted at rest, `scope` is recorded but not enforced, and only an OpenAI-compatible
+provider has been exercised live — the Anthropic path is still mock-only. Those are stated
+in full in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#before-this-guards-someone-elses-data).
+
+The path has been exercised end to end against a **live** provider
+([`scripts/e2e_live.sh`](scripts/e2e_live.sh)), which found and closed two real integration
+gaps: `reasoning_content` was not rehydrated, and providers requiring a custom header could
+not be reached at all.
 
 ### Milestones
 

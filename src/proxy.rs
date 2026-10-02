@@ -59,6 +59,11 @@ pub struct ProxyState {
     pub request_timeout: Duration,
     /// Process start time, for `/healthz`.
     pub started_at: Instant,
+    /// Client header names to pass through to the upstream, lowercased. Opt-in:
+    /// nothing is forwarded unless listed here.
+    pub forward_headers: Vec<String>,
+    /// Static headers added to every upstream request, as `(name, value)`.
+    pub extra_upstream_headers: Vec<(String, String)>,
 }
 
 impl ProxyState {
@@ -75,6 +80,26 @@ impl ProxyState {
             anthropic_version: "2023-06-01".into(),
             request_timeout: Duration::from_secs(600),
             started_at: Instant::now(),
+            forward_headers: Vec::new(),
+            extra_upstream_headers: Vec::new(),
+        }
+    }
+}
+
+/// Parse `PORTCULLIS_UPSTREAM_HEADERS`, a JSON object of header name → value.
+/// Example: `{"x-opencode-session":"portcullis"}`.
+fn parse_extra_headers(raw: &str) -> Vec<(String, String)> {
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    match serde_json::from_str::<serde_json::Map<String, Value>>(raw) {
+        Ok(map) => map
+            .into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "PORTCULLIS_UPSTREAM_HEADERS is not a JSON object; ignoring");
+            Vec::new()
         }
     }
 }
@@ -99,12 +124,30 @@ fn env_secs(key: &str, default: u64) -> Duration {
 async fn send_upstream(
     state: &ProxyState,
     streaming: bool,
+    client_headers: &HeaderMap,
     build: impl Fn() -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, (StatusCode, String)> {
     let mut attempt = 0;
     loop {
         attempt += 1;
         let mut request = build();
+
+        // Headers configured for this upstream (e.g. providers that require a
+        // project or session header).
+        for (name, value) in &state.extra_upstream_headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+
+        // Opt-in pass-through of client headers. Nothing is forwarded unless it
+        // was explicitly listed, so an unrelated credential cannot ride along.
+        for name in &state.forward_headers {
+            if let Some(value) = client_headers.get(name.as_str()) {
+                if let Ok(value) = value.to_str() {
+                    request = request.header(name.as_str(), value);
+                }
+            }
+        }
+
         if !streaming {
             request = request.timeout(state.request_timeout);
         }
@@ -435,14 +478,22 @@ fn replace_string_leaves(value: &mut Value, redacted: &[String], idx: &mut usize
     }
 }
 
-pub async fn chat_completions(State(state): State<ProxyState>, Json(body): Json<Value>) -> Response {
-    match handle(state, body).await {
+pub async fn chat_completions(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    match handle(state, headers, body).await {
         Ok(resp) => resp,
         Err((status, msg)) => (status, msg).into_response(),
     }
 }
 
-async fn handle(state: ProxyState, body: Value) -> Result<Response, (StatusCode, String)> {
+async fn handle(
+    state: ProxyState,
+    headers: HeaderMap,
+    body: Value,
+) -> Result<Response, (StatusCode, String)> {
     let messages = body
         .get("messages")
         .and_then(|m| m.as_array())
@@ -504,7 +555,7 @@ async fn handle(state: ProxyState, body: Value) -> Result<Response, (StatusCode,
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let upstream_resp = send_upstream(&state, streaming, || {
+    let upstream_resp = send_upstream(&state, streaming, &headers, || {
         state
             .client
             .post(&state.upstream_url)
@@ -523,16 +574,17 @@ async fn handle(state: ProxyState, body: Value) -> Result<Response, (StatusCode,
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
-    // Rehydrate assistant content locally before returning to the caller.
-    if let Some(choices) = upstream_json.get_mut("choices").and_then(|c| c.as_array_mut()) {
-        for choice in choices.iter_mut() {
-            if let Some(msg) = choice.get_mut("message") {
-                if let Some(content) = msg.get_mut("content").and_then(|c| c.as_str()) {
-                    let restored = {
-                        let gw = state.gateway.lock().await;
-                        gw.rehydrate(content)
-                    };
-                    msg["content"] = json!(restored);
+    // Rehydrate assistant text locally before returning to the caller. Covers
+    // content, reasoning content, and tool-call arguments.
+    {
+        let gw = state.gateway.lock().await;
+        if let Some(choices) = upstream_json
+            .get_mut("choices")
+            .and_then(|c| c.as_array_mut())
+        {
+            for choice in choices.iter_mut() {
+                if let Some(msg) = choice.get_mut("message") {
+                    rehydrate_response_message(msg, &gw);
                 }
             }
         }
@@ -612,7 +664,7 @@ async fn handle_anthropic(
         .map(|s| s.to_string())
         .unwrap_or_else(|| state.anthropic_version.clone());
 
-    let upstream_resp = send_upstream(&state, streaming, || {
+    let upstream_resp = send_upstream(&state, streaming, &headers, || {
         state
             .client
             .post(&state.anthropic_upstream_url)
@@ -770,6 +822,9 @@ const MAX_PENDING: usize = 256;
 struct StreamCarry {
     content: String,
     args: String,
+    /// Reasoning/thinking keeps its own buffer. Two text fields interleave in one
+    /// stream, so stitching a split placeholder across them would corrupt both.
+    reasoning: String,
 }
 
 /// Split `combined` into (safe to emit, holds back a partial placeholder).
@@ -804,7 +859,7 @@ fn rehydrate_with_carry(text: &str, pending: &mut String, gw: &Gateway) -> Strin
 
 /// Emit any held-back text as a final synthetic delta event.
 async fn flush_carry(carry: &mut StreamCarry, gw: &Arc<Mutex<Gateway>>) -> String {
-    if carry.content.is_empty() && carry.args.is_empty() {
+    if carry.content.is_empty() && carry.args.is_empty() && carry.reasoning.is_empty() {
         return String::new();
     }
     let gw_guard = gw.lock().await;
@@ -814,6 +869,14 @@ async fn flush_carry(carry: &mut StreamCarry, gw: &Arc<Mutex<Gateway>>) -> Strin
         deltas.push(json!({
             "index": 0,
             "delta": { "content": gw_guard.rehydrate(&held) },
+            "finish_reason": null
+        }));
+    }
+    if !carry.reasoning.is_empty() {
+        let held = std::mem::take(&mut carry.reasoning);
+        deltas.push(json!({
+            "index": 0,
+            "delta": { "reasoning_content": gw_guard.rehydrate(&held) },
             "finish_reason": null
         }));
     }
@@ -872,7 +935,8 @@ async fn process_sse_event(
 }
 
 /// Apply `Gateway::rehydrate` to every text-bearing delta field in a streaming
-/// chunk: `choices[].delta.content` and `choices[].delta.tool_calls[].function.arguments`.
+/// chunk: `choices[].delta.content`, `choices[].delta.reasoning_content`, and
+/// `choices[].delta.tool_calls[].function.arguments`.
 async fn rehydrate_sse_delta(
     value: &mut Value,
     carry: &mut StreamCarry,
@@ -890,8 +954,35 @@ async fn rehydrate_sse_delta(
             let rehydrated = rehydrate_with_carry(content, &mut carry.content, &gw_guard);
             *content = rehydrated;
         }
+        // Reasoning models stream a second text field. Without this, a
+        // placeholder the model *reasoned* about comes back to the client as a
+        // literal `<<ORG_1>>`.
+        if let Some(Value::String(reasoning)) = delta.get_mut("reasoning_content") {
+            let rehydrated = rehydrate_with_carry(reasoning, &mut carry.reasoning, &gw_guard);
+            *reasoning = rehydrated;
+        }
         if let Some(tool_calls) = delta.get_mut("tool_calls") {
             rehydrate_tool_calls(tool_calls, &mut carry.args, &gw_guard);
+        }
+    }
+}
+
+/// Rehydrate the text-bearing fields of a complete (non-streaming) assistant
+/// message: content, reasoning content, and tool-call arguments.
+fn rehydrate_response_message(msg: &mut Value, gw: &Gateway) {
+    for field in ["content", "reasoning_content"] {
+        if let Some(Value::String(text)) = msg.get_mut(field) {
+            *text = gw.rehydrate(text);
+        }
+    }
+    if let Some(calls) = msg.get_mut("tool_calls").and_then(|c| c.as_array_mut()) {
+        for call in calls.iter_mut() {
+            if let Some(Value::String(args)) = call
+                .get_mut("function")
+                .and_then(|f| f.get_mut("arguments"))
+            {
+                *args = gw.rehydrate(args);
+            }
         }
     }
 }
@@ -1268,6 +1359,22 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
     let read_timeout = env_secs("PORTCULLIS_READ_TIMEOUT_SECS", 180);
     let request_timeout = env_secs("PORTCULLIS_REQUEST_TIMEOUT_SECS", 600);
 
+    // Opt-in client-header pass-through, e.g. `x-opencode-session`. Nothing is
+    // forwarded unless named here.
+    let forward_headers: Vec<String> = std::env::var("PORTCULLIS_FORWARD_HEADERS")
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Static upstream headers, for providers that require one on every call.
+    let extra_upstream_headers = parse_extra_headers(
+        &std::env::var("PORTCULLIS_UPSTREAM_HEADERS").unwrap_or_default(),
+    );
+
     let client = Client::builder()
         .use_rustls_tls()
         .connect_timeout(connect_timeout)
@@ -1277,6 +1384,8 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
 
     let mut state = ProxyState::new(gateway, client, upstream_url, upstream_key);
     state.request_timeout = request_timeout;
+    state.forward_headers = forward_headers;
+    state.extra_upstream_headers = extra_upstream_headers;
     state.store_path = Some(store_path);
     state.admin_token = admin_token;
     state.anthropic_upstream_url = anthropic_upstream_url;
