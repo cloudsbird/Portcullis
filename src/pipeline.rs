@@ -80,6 +80,11 @@ impl Gateway {
     }
 
     fn push_suggestion(&mut self, term: &str) {
+        // Deduplicate: move an existing entry to the back so repeats do not
+        // flood the bounded buffer, and the most recent sightings are kept.
+        if let Some(pos) = self.suggestions.iter().position(|t| t == term) {
+            self.suggestions.remove(pos);
+        }
         if self.suggestions.len() >= SUGGESTION_LIMIT {
             self.suggestions.pop_front();
         }
@@ -186,5 +191,27 @@ impl Gateway {
     /// Rehydrate a model response locally (tolerant of placeholder reformatting).
     pub fn rehydrate(&self, text: &str) -> String {
         self.vault.restore(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggestions_are_deduplicated_and_bounded() {
+        let mut gw = Gateway::new(Store::default());
+
+        // Repeats must not flood the buffer.
+        for _ in 0..10 {
+            gw.push_suggestion("repeat@example.com");
+        }
+        assert_eq!(gw.suggestions().len(), 1);
+
+        // The buffer stays bounded at SUGGESTION_LIMIT.
+        for i in 0..(SUGGESTION_LIMIT + 50) {
+            gw.push_suggestion(&format!("user{i}@example.com"));
+        }
+        assert_eq!(gw.suggestions().len(), SUGGESTION_LIMIT);
     }
 }
