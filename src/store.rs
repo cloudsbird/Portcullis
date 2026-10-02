@@ -20,10 +20,12 @@ pub struct Entry {
     pub source: String,
 }
 
-/// The learned entity store. Local-only, encrypted at rest (M1), **never synced**.
+/// The learned entity store. Local-only. **Never synced.**
 ///
-/// This file is the crown jewels: a map of everything you consider private. It must
-/// never leave the machine and must never be committed (see `.gitignore`).
+/// NOTE: persisted as **plaintext JSON** — there is no encryption at rest yet
+/// (see docs/TEACHING.md, "What teaching does NOT do"). This file is the crown
+/// jewels: a map of everything you consider private. It must never leave the
+/// machine and must never be committed (see `.gitignore`).
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Store {
     #[serde(default)]

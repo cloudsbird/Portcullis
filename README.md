@@ -74,6 +74,7 @@ then `proxy`, `m2_teach`, `streaming`, `anthropic` and `onnx_detector`.
 
 ## Docs
 
+- [**docs/TEACHING.md**](docs/TEACHING.md) — how the learning loop works, and what it does *not* do yet
 - [**docs/EXAMPLE.md**](docs/EXAMPLE.md) — what the provider actually sees (real before/after, including the learning loop)
 - [**docs/RESOURCES.md**](docs/RESOURCES.md) — measured CPU, RAM, disk and latency
 - [**docs/CLIENTS.md**](docs/CLIENTS.md) — Hermes, OpenCode, Claude Code, Cursor, Aider and more
