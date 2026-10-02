@@ -40,6 +40,53 @@ invisible to the provider's prompt cache — deterministic redaction *saves* you
 instead of costing it. Determinism also keeps the model coherent: the same value always
 gets the same placeholder.
 
+## Benchmark
+
+On the **[PII Masking Benchmark](https://huggingface.co/datasets/piimb/pii-masking-benchmark)**
+(PIIMB) — character-level masking **F2**, label-agnostic, micro-averaged per task:
+
+> ## Avg F2 = 0.819 — **4th of 20 published entries**
+
+| Task | Precision | Recall | **F2** |
+|---|---|---|---|
+| gretel | 0.887 | 0.945 | **0.933** |
+| ai4privacy-en (OpenPII) | 0.756 | 0.908 | **0.873** |
+| nemotron-pii | 0.754 | 0.875 | **0.848** |
+| privy | 0.316 | 0.823 | **0.623** |
+| **Average** | 0.678 | 0.888 | **0.819** |
+
+**What counts as a good value.** Across all 20 published entries the range is
+**0.42 – 0.89**, so read it as:
+
+| Band | Avg F2 |
+|---|---|
+| SOTA | **≥ 0.87** |
+| Strong | **≥ 0.83** |
+| Upper quartile | ≥ 0.78 |
+| **Median** | **0.72** |
+| Bottom quartile | ≤ 0.67 |
+
+**Where 0.819 lands: top quartile, within 1.2 points of the best general-purpose model.**
+For calibration it beats `openai/privacy-filter` (**0.708**) by 0.111, and
+`knowledgator/gliner-pii-base-v1.0` (**0.738**) by 0.081.
+
+It also wins outright on two of the four tasks — gretel (**0.933** vs 0.920) and
+nemotron-pii (**0.848** vs 0.772) — against `nvidia/gliner-PII`, the highest-ranked
+non-clinical entry.
+
+Reproduce:
+
+```bash
+cargo build --release --features onnx
+python benchmarks/pii_masking/run.py --binary ./target/release/portcullis \
+  --model-dir ./model --sample 2000 --out benchmarks/pii_masking/results.json
+```
+
+Full numbers, methodology and honest limitations: **[benchmarks/RESULTS.md](benchmarks/RESULTS.md)**.
+
+> This benchmarks the **detector**. PIIMB cannot measure what the gateway adds — cache
+> invalidation, rehydration, fail-closed. Those are covered by `tests/invariants.rs`.
+
 ## Quickstart
 
 ```bash
