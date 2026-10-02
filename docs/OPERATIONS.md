@@ -84,7 +84,8 @@ Detection is CPU-bound and synchronous. It runs on the **blocking pool**
 starve unrelated requests.
 
 That said, a single `Gateway` sits behind one mutex, so **detection itself serialises**:
-one scan at a time. Measured throughput is ~0.28 s/sentence on the reference host, so
+one scan at a time (response rehydration no longer takes the lock — each request restores
+from its own vault — so streaming responses never wait on someone else's scan). Measured throughput is ~0.28 s/sentence on the reference host, so
 expect roughly 3–4 scans/second, and remember a 4,000-character prompt is ~2.9 s.
 
 The delta cache absorbs most of the real cost in a conversation — only the *new* text in

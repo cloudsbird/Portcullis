@@ -179,7 +179,7 @@ The provider never receives a payload that failed its own check.
 | File | Responsibility |
 |---|---|
 | `src/main.rs` | CLI: `teach` / `unteach` / `scan` / `serve` |
-| `src/proxy.rs` | HTTP surface — OpenAI `/v1/chat/completions`, Anthropic `/v1/messages`, the learning endpoints, and SSE streaming |
+| `src/proxy/` | HTTP surface — `mod.rs` (state, routing, upstream), `openai.rs` and `anthropic.rs` (request redaction, rehydration, SSE), `stream.rs` (split-placeholder carry), `admin.rs` (the learning endpoints) |
 | `src/pipeline.rs` | `Gateway` — the delta cache, `teach`/`unteach`, `process`, `assert_clean`, `rehydrate` |
 | `src/detect.rs` | `DictionaryDetector`, `RegexDetector`, `merge` priority, the `Detector` trait |
 | `src/detect_onnx.rs` | `OnnxDetector` — GLiNER2-PII in-process via `ort` (feature `onnx`) |

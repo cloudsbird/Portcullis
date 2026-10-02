@@ -42,5 +42,9 @@ originals**, so the cache itself is not a plaintext corpus.
 3. **Stale redaction** — teaching a term invalidates cached redactions (invariant 3).
 4. **Silent leak** — a fail-closed outbound assertion blocks a request that still
    contains a protected term or a malformed placeholder (invariant 4).
+   The assertion checks **taught terms only**. It deliberately does not re-run the regex
+   or ML detectors over the assembled body: JSON is full of numbers (timestamps, token
+   counts) that look like phone numbers, so it would reject ordinary requests. A value
+   that only a detector could have caught, and missed, is not stopped here.
 5. **Prompt-cache sabotage** — redaction is a pure, stable function of the text, and
-   unchanged segments are re-emitted byte-identically.
+   unchanged history is redacted and numbered identically on every turn.
