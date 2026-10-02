@@ -33,6 +33,29 @@ const DEFAULT_LABELS: &[&str] = &[
     "city",
 ];
 
+/// Label set resolution order: `PORTCULLIS_LABELS` (comma-separated) → the
+/// built-in default. Benchmarks and specialised deployments pass their own set.
+fn resolve_labels() -> Vec<String> {
+    match std::env::var("PORTCULLIS_LABELS") {
+        Ok(v) if !v.trim().is_empty() => v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => DEFAULT_LABELS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// Confidence threshold resolution: `PORTCULLIS_THRESHOLD` → 0.5.
+/// Recall-oriented deployments (and the PIIMB benchmark) use 0.3.
+fn resolve_threshold() -> f32 {
+    std::env::var("PORTCULLIS_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|t| (0.0..=1.0).contains(t))
+        .unwrap_or(0.5)
+}
+
 const NER_TASK_NAME: &str = "entities";
 const SCHEMA_OPEN: &str = "(";
 const SCHEMA_CLOSE: &str = ")";
@@ -63,6 +86,7 @@ pub struct OnnxDetector {
     special_tokens: HashMap<String, u32>,
     max_width: usize,
     labels: Vec<String>,
+    threshold: f32,
 }
 
 impl OnnxDetector {
@@ -107,13 +131,31 @@ impl OnnxDetector {
             tokenizer,
             special_tokens,
             max_width: config.max_width,
-            labels: DEFAULT_LABELS.iter().map(|s| s.to_string()).collect(),
+            labels: resolve_labels(),
+            threshold: resolve_threshold(),
         })
     }
 
     /// Return the label set used by the detector.
     pub fn labels(&self) -> &[String] {
         &self.labels
+    }
+
+    /// Override the label set (builder).
+    pub fn with_labels(mut self, labels: Vec<String>) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    /// Override the confidence threshold (builder).
+    pub fn with_threshold(mut self, threshold: f32) -> Self {
+        self.threshold = threshold;
+        self
+    }
+
+    /// Return the confidence threshold in use.
+    pub fn threshold(&self) -> f32 {
+        self.threshold
     }
 }
 
@@ -140,7 +182,7 @@ fn read_json<T: serde::de::DeserializeOwned, P: AsRef<Path>>(path: P) -> Result<
 
 impl Detector for OnnxDetector {
     fn detect(&self, text: &str) -> Vec<Span> {
-        self.detect_with_threshold(text, 0.5)
+        self.detect_with_threshold(text, self.threshold)
     }
 }
 
