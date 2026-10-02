@@ -393,18 +393,31 @@ impl Gateway {
     }
 
     /// [`Gateway::assert_clean`] for a request in `scope`.
-    pub fn assert_clean_scoped(
+    /// Only the taught-term half of [`Gateway::assert_clean_scoped`]. For checking the
+    /// individual strings of a JSON body, where "<<" without ">>" is just prose.
+    pub fn assert_no_terms_scoped(
         &self,
         scope: Option<&str>,
-        outbound: &[String],
+        segments: &[String],
     ) -> Result<(), String> {
         let dict = self.dictionary(scope);
-        for seg in outbound {
+        for seg in segments {
             for span in dict.detect(seg) {
                 if !self.store.is_allowed_for(scope, &seg[span.start..span.end]) {
                     return Err("residual protected term in outbound".into());
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub fn assert_clean_scoped(
+        &self,
+        scope: Option<&str>,
+        outbound: &[String],
+    ) -> Result<(), String> {
+        self.assert_no_terms_scoped(scope, outbound)?;
+        for seg in outbound {
             if seg.contains("<<") && !seg.contains(">>") {
                 return Err("malformed placeholder in outbound".into());
             }

@@ -194,17 +194,7 @@ pub(super) async fn handle(
     // collect a field that carries a protected term, this is what stops it leaving.
     {
         let gw = state.gateway.lock().await;
-        let assembled = serde_json::to_string(&upstream_body)
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-        gw.assert_clean_scoped(scope.as_deref(), &[assembled])
-            .map_err(|e| {
-                state.metrics.blocked(if e.contains("residual") {
-                    "residual_term"
-                } else {
-                    "malformed_placeholder"
-                });
-                (StatusCode::BAD_GATEWAY, e)
-            })?;
+        assert_outbound_clean(&gw, &state.metrics, scope.as_deref(), &upstream_body)?;
     }
 
     let streaming = body

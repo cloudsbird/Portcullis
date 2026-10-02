@@ -536,3 +536,50 @@ pub(super) fn resolve_scope(
         }
     }
 }
+
+/// Every decoded string in `body` — values **and** object keys.
+///
+/// The fail-closed assertion also runs over the serialized body, but JSON escapes some
+/// characters (`"`, `\`, control characters, and optionally non-ASCII), so a taught
+/// term containing one would not appear verbatim there. Checking the decoded strings
+/// closes that gap.
+pub(super) fn outbound_strings(body: &Value) -> Vec<String> {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::Object(m) => {
+                for (k, x) in m {
+                    out.push(k.clone());
+                    walk(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(body, &mut out);
+    out
+}
+
+/// The fail-closed outbound check (invariant 4), shared by both providers' handlers.
+/// Counts a block in the metrics by reason.
+pub(super) fn assert_outbound_clean(
+    gw: &Gateway,
+    metrics: &crate::Metrics,
+    scope: Option<&str>,
+    body: &Value,
+) -> Result<(), (StatusCode, String)> {
+    let assembled =
+        serde_json::to_string(body).map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    gw.assert_clean_scoped(scope, &[assembled])
+        .and_then(|()| gw.assert_no_terms_scoped(scope, &outbound_strings(body)))
+        .map_err(|e| {
+            metrics.blocked(if e.contains("residual") {
+                "residual_term"
+            } else {
+                "malformed_placeholder"
+            });
+            (StatusCode::BAD_GATEWAY, e)
+        })
+}

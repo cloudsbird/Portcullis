@@ -186,3 +186,50 @@ fn save_tightens_a_pre_existing_loose_file() {
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "an existing 0644 store should be tightened");
 }
+
+/// A taught term containing a character JSON escapes (`"`) never appears verbatim in the
+/// serialized body, so the fail-closed check must also look at the decoded strings. Here
+/// the term rides in a field the redaction walker does not collect (`metadata`).
+#[tokio::test]
+async fn fail_closed_catches_terms_that_json_escapes() {
+    use std::sync::Arc;
+
+    let mut store = Store::default();
+    store.teach("the \"Falcon\" project", "ORG", "global");
+    let hits = Arc::new(tokio::sync::Mutex::new(0u32));
+    let counter = hits.clone();
+    let upstream = spawn(axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move || {
+            let counter = counter.clone();
+            async move {
+                *counter.lock().await += 1;
+                axum::Json(serde_json::json!({"choices": []}))
+            }
+        }),
+    ))
+    .await;
+    let mut state = proxy_state(
+        Duration::from_secs(5),
+        format!("{upstream}/v1/chat/completions"),
+    );
+    state.gateway = Arc::new(tokio::sync::Mutex::new(portcullis::Gateway::new(store)));
+    let base = spawn(app(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"note": "about the \"Falcon\" project"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        502,
+        "a term in an unwalked field must fail closed"
+    );
+    assert_eq!(*hits.lock().await, 0, "nothing may reach the upstream");
+}
