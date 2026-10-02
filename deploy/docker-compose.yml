@@ -1,0 +1,57 @@
+# Portcullis — local privacy gateway.
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# Set the values below in a .env file next to this compose file (or export them).
+# Keep the note about the published port in mind: the proxy endpoints are
+# UNAUTHENTICATED. See docs/DEPLOYMENT.md.
+
+services:
+  portcullis:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: portcullis:latest
+    container_name: portcullis
+    restart: unless-stopped
+
+    # Loopback only. Change to "8080:8080" ONLY if you are terminating auth in
+    # front of it — otherwise anyone who can reach the port can spend your
+    # provider credits.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    environment:
+      # --- upstream provider (required) ---
+      PORTCULLIS_UPSTREAM_URL: ${PORTCULLIS_UPSTREAM_URL:-https://openrouter.ai/api/v1}
+      PORTCULLIS_UPSTREAM_KEY: ${PORTCULLIS_UPSTREAM_KEY:?set PORTCULLIS_UPSTREAM_KEY}
+
+      # --- admin surface (guards /teach, /terms, /suggestions) ---
+      PORTCULLIS_ADMIN_TOKEN: ${PORTCULLIS_ADMIN_TOKEN:?set PORTCULLIS_ADMIN_TOKEN}
+
+      # --- detector: omit PORTCULLIS_MODEL_DIR to run deterministic-only ---
+      PORTCULLIS_MODEL_DIR: ${PORTCULLIS_MODEL_DIR:-/model}
+      PORTCULLIS_LABELS: ${PORTCULLIS_LABELS:-}
+      PORTCULLIS_THRESHOLD: ${PORTCULLIS_THRESHOLD:-0.5}
+
+      # --- ops ---
+      PORTCULLIS_LOG_FORMAT: json
+      PORTCULLIS_MAX_BODY_BYTES: ${PORTCULLIS_MAX_BODY_BYTES:-2097152}
+
+    volumes:
+      # the learned store — the crown jewels. Must persist.
+      - portcullis-data:/data
+      # the ONNX model, read-only. Comment out for a deterministic-only build.
+      - ${PORTCULLIS_MODEL_HOST_DIR:-../model}:/model:ro
+
+    healthcheck:
+      # `portcullis --help` would only prove the binary starts; this proves the
+      # proxy is actually answering.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  portcullis-data:

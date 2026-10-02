@@ -1,0 +1,36 @@
+[Unit]
+Description=Portcullis privacy gateway
+Documentation=https://github.com/cloudsbird/Portcullis/blob/main/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/portcullis.env
+ExecStart=/usr/local/bin/portcullis serve --bind 127.0.0.1:8080
+Restart=on-failure
+RestartSec=3
+
+# The loopback bind is deliberate: the proxy endpoints are unauthenticated, so
+# do not change it to 0.0.0.0 without putting auth in front. docs/DEPLOYMENT.md.
+
+# It needs almost nothing: a read-only model dir and one writable store path.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/lib/portcullis
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

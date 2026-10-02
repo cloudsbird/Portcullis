@@ -138,6 +138,8 @@ then `proxy`, `m2_teach`, `streaming`, `anthropic` and `onnx_detector`.
 
 ## Docs
 
+- [**docs/DEPLOYMENT.md**](docs/DEPLOYMENT.md) — how to actually run it: the two URLs, provider cheat-sheet, Docker, systemd, troubleshooting
+- [**docs/OPERATIONS.md**](docs/OPERATIONS.md) — timeouts, limits, health, logs, and the gaps that remain
 - [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md) — how a prompt flows end to end (diagrams)
 - [**docs/MODELS.md**](docs/MODELS.md) — choosing a detector: the registry, precedence, and what's supported
 - [**docs/TEACHING.md**](docs/TEACHING.md) — how the learning loop works, and what it does *not* do yet

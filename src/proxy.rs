@@ -86,21 +86,50 @@ impl ProxyState {
     }
 }
 
+/// Accept either a full endpoint (`.../chat/completions`) or the base URL that
+/// provider docs usually show (`https://openrouter.ai/api/v1`), and resolve it to
+/// a full endpoint.
+///
+/// Only appended when the path clearly does not already name one, so an Azure
+/// deployment URL or an existing query string is left alone.
+fn normalize_chat_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.contains('?') || trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
+/// The Anthropic equivalent of [`normalize_chat_url`].
+fn normalize_messages_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.contains('?') || trimmed.ends_with("/messages") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/messages")
+    }
+}
+
 /// Parse `PORTCULLIS_UPSTREAM_HEADERS`, a JSON object of header name → value.
-/// Example: `{"x-opencode-session":"portcullis"}`.
-fn parse_extra_headers(raw: &str) -> Vec<(String, String)> {
+/// Example: `'{"x-opencode-session":"portcullis"}'` (note the single quotes — a
+/// shell `VAR={"k":"v"}` assignment strips the inner double quotes).
+///
+/// Malformed input is a **startup error**, not a warning: a typo here would
+/// otherwise surface later as a confusing provider-side failure on every request.
+fn parse_extra_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
     if raw.trim().is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     match serde_json::from_str::<serde_json::Map<String, Value>>(raw) {
-        Ok(map) => map
+        Ok(map) => Ok(map
             .into_iter()
             .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
-            .collect(),
-        Err(e) => {
-            tracing::warn!(error = %e, "PORTCULLIS_UPSTREAM_HEADERS is not a JSON object; ignoring");
-            Vec::new()
-        }
+            .collect()),
+        Err(e) => Err(format!(
+            "PORTCULLIS_UPSTREAM_HEADERS must be a JSON object with string values, \
+             e.g. '{{\"x-opencode-session\":\"abc\"}}' — got: {raw} ({e})"
+        )),
     }
 }
 
@@ -1334,6 +1363,8 @@ pub fn app(state: ProxyState) -> Router {
 pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
     let upstream_url = std::env::var("PORTCULLIS_UPSTREAM_URL")
         .map_err(|_| anyhow::anyhow!("PORTCULLIS_UPSTREAM_URL is not set"))?;
+    // Accept a base URL or a full endpoint — see normalize_chat_url.
+    let upstream_url = normalize_chat_url(&upstream_url);
     let upstream_key = std::env::var("PORTCULLIS_UPSTREAM_KEY").unwrap_or_default();
     let store_path = std::env::var("PORTCULLIS_STORE").unwrap_or_else(|_| "store.json".into());
     let admin_token = std::env::var("PORTCULLIS_ADMIN_TOKEN").unwrap_or_default();
@@ -1345,6 +1376,7 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
 
     let anthropic_upstream_url = std::env::var("PORTCULLIS_ANTHROPIC_UPSTREAM_URL")
         .unwrap_or_else(|_| "https://api.anthropic.com/v1/messages".into());
+    let anthropic_upstream_url = normalize_messages_url(&anthropic_upstream_url);
     let anthropic_upstream_key = std::env::var("PORTCULLIS_ANTHROPIC_KEY").unwrap_or_default();
     let anthropic_version = std::env::var("PORTCULLIS_ANTHROPIC_VERSION")
         .unwrap_or_else(|_| "2023-06-01".into());
@@ -1371,9 +1403,11 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
         .unwrap_or_default();
 
     // Static upstream headers, for providers that require one on every call.
+    // A malformed value fails startup rather than silently dropping the header.
     let extra_upstream_headers = parse_extra_headers(
         &std::env::var("PORTCULLIS_UPSTREAM_HEADERS").unwrap_or_default(),
-    );
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     let client = Client::builder()
         .use_rustls_tls()
@@ -1393,6 +1427,20 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
     state.anthropic_version = anthropic_version;
     let addr: SocketAddr = bind.parse()?;
     let listener = TcpListener::bind(addr).await?;
+
+    // Say plainly where traffic is going. The single most common deployment
+    // mistake is pointing the upstream somewhere unexpected.
+    tracing::info!(
+        listen = %addr,
+        openai_upstream = %state.upstream_url,
+        anthropic_upstream = %state.anthropic_upstream_url,
+        store = %state.store_path.clone().unwrap_or_default(),
+        forward_headers = ?state.forward_headers,
+        extra_upstream_headers = state.extra_upstream_headers.len(),
+        admin_api = state.admin_token.is_some(),
+        "portcullis listening"
+    );
+
     axum::serve(listener, app(state)).await?;
     Ok(())
 }
