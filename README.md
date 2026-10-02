@@ -202,6 +202,9 @@ curl -X POST http://127.0.0.1:8080/teach \
   -d '{"term":"Project Loki","label":"ORG"}'
 ```
 
+Add `"whole_word": true` (CLI: `--whole-word`) so a short term such as `Ann` only matches as a
+whole word and leaves `Announcement` alone.
+
 `/suggestions` returns terms the detector found but that you have not taught — the review
 queue for keeping the store current. Teaching clears the delta cache, so it applies
 immediately, including to messages the provider has already seen.

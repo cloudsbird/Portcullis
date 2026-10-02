@@ -102,13 +102,17 @@ flagged it, and it is skipped by `assert_clean`.
 
 ## The vault: why placeholders are stable
 
-`<<EMAIL_1>>` is a **pure function of the value**, not a counter over the conversation.
+`<<EMAIL_1>>` is numbered in order of first appearance **within one request**. Every request
+gets its own vault, so placeholders are only meaningful inside the conversation that minted
+them — a vault shared between clients would restore one client's values into another's
+response.
 
 Two consequences, both load-bearing:
 
 1. **The model stays coherent** — it can refer back to `<<PERSON_1>>` across turns.
-2. **The provider's prompt cache is preserved** — untouched segments are re-emitted
-   byte-identically, so deterministic redaction *saves* tokens rather than costing them.
+2. **The provider's prompt cache is preserved** — clients resend the whole history every
+   turn, so an unchanged prefix is redacted and numbered identically, and deterministic
+   redaction *saves* tokens rather than costing them.
 
 Rehydration is tolerant: whitespace, case and surrounding punctuation are matched
 loosely, so a model that reformats a placeholder still gets restored correctly.
@@ -128,7 +132,8 @@ flowchart TD
     C2 -- "no (1 of 3)" --> SCAN["scan just the new turn"]
 ```
 
-The cache stores `sha256(original) → redacted`. It **never stores the original**, so a
+The cache stores `sha256(original) → span offsets` (never the redacted text, so a hit is
+applied against the current request's vault). It **never stores the original**, so a
 cache dump is not a leak. And because it is keyed on content, a *changed* segment is
 rescanned automatically — the cache can never serve a stale redaction.
 

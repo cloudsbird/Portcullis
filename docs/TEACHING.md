@@ -130,7 +130,8 @@ blunter — than you might assume. Reproduce everything below with
 
 **It is an exact, case-insensitive substring match.** Teaching `Cartalian` matches
 `cartalian`, `CARTALIAN`, `Cartalian's` and `Cartalian Inc.`, because the search is a plain
-`find` over the lowercased text.
+single case-insensitive pass over the original text (so Unicode case mapping cannot shift
+the matched offsets).
 
 ### Three consequences
 
@@ -146,8 +147,10 @@ Ann is the contact. See the Announcement and the Annual report.
 
 Your client gets the right text back, but the **provider receives a mangled prompt** — "the
 `<<PERSON_1>>ouncement`" is not a word, which degrades the answer the model can give even
-though nothing leaked. Until this is fixed, teach distinctive strings rather than short
-common ones.
+though nothing leaked. By default this is deliberate: over-redacting is the safe failure for a privacy
+tool. For short common terms, opt in to whole-word matching
+(`portcullis teach Ann --label PERSON --whole-word`, or `"whole_word": true` on `/teach`),
+so `Ann` leaves `Announcement` alone.
 
 **2. The detector's *labels* are unreliable, though the redaction is still correct.** With
 an empty store, one test sentence came out as:
