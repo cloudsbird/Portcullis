@@ -73,6 +73,9 @@ pub struct ProxyState {
     pub metrics: Arc<crate::Metrics>,
     /// Bearer token required by `/metrics`. `None`: open, like `/healthz`.
     pub metrics_token: Option<String>,
+    /// Serializes teach/unteach so their read-modify-write of the store file cannot
+    /// interleave. Held across disk I/O, which is why it is not the gateway lock.
+    pub store_write_lock: Arc<Mutex<()>>,
 }
 
 impl ProxyState {
@@ -100,6 +103,7 @@ impl ProxyState {
             scope_tokens: Vec::new(),
             metrics,
             metrics_token: None,
+            store_write_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -267,10 +271,9 @@ async fn metrics_handler(State(state): State<ProxyState>, headers: HeaderMap) ->
 /// Liveness and readiness probe. Unauthenticated, and deliberately reports only
 /// counts — never a term, a value or a key.
 async fn healthz(State(state): State<ProxyState>) -> Json<Value> {
-    let store_terms = {
-        let gw = state.gateway.lock().await;
-        gw.store.deny.len()
-    };
+    // Lock-free on purpose: scans serialize and can take seconds, and a liveness probe
+    // that queues behind one gets a healthy process restarted.
+    let store_terms = state.metrics.store_terms();
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
@@ -532,4 +535,51 @@ pub(super) fn resolve_scope(
             ))
         }
     }
+}
+
+/// Every decoded string in `body` — values **and** object keys.
+///
+/// The fail-closed assertion also runs over the serialized body, but JSON escapes some
+/// characters (`"`, `\`, control characters, and optionally non-ASCII), so a taught
+/// term containing one would not appear verbatim there. Checking the decoded strings
+/// closes that gap.
+pub(super) fn outbound_strings(body: &Value) -> Vec<String> {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::Object(m) => {
+                for (k, x) in m {
+                    out.push(k.clone());
+                    walk(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(body, &mut out);
+    out
+}
+
+/// The fail-closed outbound check (invariant 4), shared by both providers' handlers.
+/// Counts a block in the metrics by reason.
+pub(super) fn assert_outbound_clean(
+    gw: &Gateway,
+    metrics: &crate::Metrics,
+    scope: Option<&str>,
+    body: &Value,
+) -> Result<(), (StatusCode, String)> {
+    let assembled =
+        serde_json::to_string(body).map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    gw.assert_clean_scoped(scope, &[assembled])
+        .and_then(|()| gw.assert_no_terms_scoped(scope, &outbound_strings(body)))
+        .map_err(|e| {
+            metrics.blocked(if e.contains("residual") {
+                "residual_term"
+            } else {
+                "malformed_placeholder"
+            });
+            (StatusCode::BAD_GATEWAY, e)
+        })
 }

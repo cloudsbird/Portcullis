@@ -10,7 +10,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use ndarray::{Array2, Array3, Axis, Ix2, Ix3};
@@ -87,6 +88,8 @@ pub struct OnnxDetector {
     max_width: usize,
     labels: Vec<String>,
     threshold: f32,
+    /// Segments where inference failed since the last [`Detector::take_failures`].
+    failures: AtomicU64,
 }
 
 impl OnnxDetector {
@@ -137,6 +140,7 @@ impl OnnxDetector {
             max_width: config.max_width,
             labels: resolve_labels(),
             threshold: resolve_threshold(),
+            failures: AtomicU64::new(0),
         })
     }
 
@@ -188,25 +192,52 @@ impl Detector for OnnxDetector {
     fn detect(&self, text: &str) -> Vec<Span> {
         self.detect_with_threshold(text, self.threshold)
     }
+
+    fn take_failures(&self) -> u64 {
+        self.failures.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// Everything the encoder needs for one text.
+struct NerInput {
+    input_ids: Array2<i64>,
+    attention_mask: Array2<i64>,
+    e_positions: Vec<usize>,
+    word_offsets: Vec<(usize, usize)>,
+    text_start_idx: usize,
+    first_token_positions: Vec<usize>,
 }
 
 impl OnnxDetector {
+    /// Inference failed for this text. The segment still has dictionary and regex
+    /// coverage, but ML recall is silently gone for it — so say so. Only the stage is
+    /// logged, never the text or an error message that might quote it.
+    fn fail(&self, stage: &str, e: &anyhow::Error) -> Vec<Span> {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            stage,
+            cause = %e.root_cause().to_string().chars().take(120).collect::<String>(),
+            "ONNX detection failed; segment has dictionary and regex coverage only"
+        );
+        Vec::new()
+    }
+
     /// Run detection with a configurable threshold.
     pub fn detect_with_threshold(&self, text: &str, threshold: f32) -> Vec<Span> {
         if text.trim().is_empty() {
             return Vec::new();
         }
 
-        let (
+        let NerInput {
             input_ids,
             attention_mask,
             e_positions,
             word_offsets,
             text_start_idx,
             first_token_positions,
-        ) = match self.build_ner_input(text) {
+        } = match self.build_ner_input(text) {
             Ok(x) => x,
-            Err(_) => return Vec::new(),
+            Err(e) => return self.fail("tokenize", &e),
         };
 
         let num_words = word_offsets.len();
@@ -217,7 +248,7 @@ impl OnnxDetector {
         // hidden: [1, seq_len, hidden]
         let hidden = match run_encoder(&self.encoder, input_ids, attention_mask) {
             Ok(h) => h,
-            Err(_) => return Vec::new(),
+            Err(e) => return self.fail("encoder", &e),
         };
 
         let dim = hidden.shape()[2];
@@ -257,12 +288,12 @@ impl OnnxDetector {
             &token_span_end,
         ) {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(e) => return self.fail("span_rep", &e),
         };
 
         let scores = match compute_scores(&self.count_embed, &span_rep, &label_embeddings) {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(e) => return self.fail("scores", &e),
         };
 
         let mut entities: Vec<RawEntity> = Vec::new();
@@ -297,33 +328,20 @@ impl OnnxDetector {
     }
 
     /// Build the NER token sequence and the word -> first-token map.
-    fn build_ner_input(
-        &self,
-        text: &str,
-    ) -> Result<(
-        Array2<i64>,
-        Array2<i64>,
-        Vec<usize>,
-        Vec<(usize, usize)>,
-        usize,
-        Vec<usize>,
-    )> {
+    fn build_ner_input(&self, text: &str) -> Result<NerInput> {
         let (mut tokens, e_positions) =
             self.build_schema_prefix(NER_TASK_NAME, &self.labels, TOKEN_E)?;
         let text_start_idx = tokens.len();
-
-        let lower = text.to_lowercase();
-        let word_re = word_pattern();
 
         let mut word_offsets: Vec<(usize, usize)> = Vec::new();
         let mut first_token_positions: Vec<usize> = Vec::new();
         let mut token_idx = 0usize;
 
-        for m in word_re.find_iter(&lower) {
-            word_offsets.push((m.start(), m.end()));
+        for (start, end) in word_spans(text) {
+            word_offsets.push((start, end));
             first_token_positions.push(token_idx);
 
-            let ids = encode_token(&self.tokenizer, m.as_str())?;
+            let ids = encode_token(&self.tokenizer, &text[start..end].to_lowercase())?;
             for &id in &ids {
                 tokens.push(id as i64);
             }
@@ -334,14 +352,14 @@ impl OnnxDetector {
         let input_ids = Array2::from_shape_vec((1, seq_len), tokens)?;
         let attention_mask = Array2::<i64>::ones((1, seq_len));
 
-        Ok((
+        Ok(NerInput {
             input_ids,
             attention_mask,
             e_positions,
             word_offsets,
             text_start_idx,
             first_token_positions,
-        ))
+        })
     }
 
     /// Build `( [P] task ( [E] label1 [E] label2 ... ) ) [SEP_TEXT]`.
@@ -412,20 +430,36 @@ impl OnnxDetector {
 fn encode_token(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     tokenizer
         .encode(text, false)
-        .map_err(|e| anyhow::anyhow!("tokenization failed for {text:?}: {e}"))
+        .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))
         .map(|enc| enc.get_ids().to_vec())
 }
 
-fn word_pattern() -> Regex {
-    Regex::new(
-        r"(?ix)
+fn word_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?ix)
         (?:https?://[^\s]+|www\.[^\s]+)
         | [a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
         | @[a-z0-9_]+
         | \w+(?:[-_]\w+)*
         | \S",
-    )
-    .expect("word regex is valid")
+        )
+        .expect("word regex is valid")
+    })
+}
+
+/// Byte ranges of the words in `text`, **in `text`'s own coordinates**.
+///
+/// The pattern is case-insensitive, so there is no need to lowercase first — and
+/// lowercasing a copy changes byte lengths for some characters (`İ`), which would shift
+/// every later offset and make the spans point at the wrong bytes of the original.
+/// Callers lowercase each word only for the tokenizer.
+fn word_spans(text: &str) -> Vec<(usize, usize)> {
+    word_pattern()
+        .find_iter(text)
+        .map(|m| (m.start(), m.end()))
+        .collect()
 }
 
 fn generate_spans(num_words: usize, max_width: usize) -> (Vec<usize>, Vec<usize>) {
@@ -545,4 +579,34 @@ fn sigmoid(mut x: Array2<f32>) -> Array2<f32> {
         }
     });
     x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_spans_index_the_original_text_even_after_length_changing_case_maps() {
+        // `İ` lowercases to two code points (3 bytes), so offsets taken from a
+        // lowercased copy would drift by one byte per `İ`.
+        let text = "İİİ met Daniel Pratt";
+        let words: Vec<&str> = word_spans(text).iter().map(|&(s, e)| &text[s..e]).collect();
+        assert_eq!(words, ["İİİ", "met", "Daniel", "Pratt"]);
+    }
+
+    #[test]
+    fn word_spans_keep_emails_and_urls_whole() {
+        let text = "mail dana@example.com or see https://example.com/x";
+        let words: Vec<&str> = word_spans(text).iter().map(|&(s, e)| &text[s..e]).collect();
+        assert_eq!(
+            words,
+            [
+                "mail",
+                "dana@example.com",
+                "or",
+                "see",
+                "https://example.com/x"
+            ]
+        );
+    }
 }

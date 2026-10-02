@@ -21,6 +21,13 @@ pub struct Span {
 /// tasks behind an `Arc<Mutex<..>>`.
 pub trait Detector: Send + Sync {
     fn detect(&self, text: &str) -> Vec<Span>;
+
+    /// Inference failures since the last call, for detectors that can fail (the ML
+    /// one). The gateway turns this into a metric, so a detector that has quietly
+    /// stopped working is visible.
+    fn take_failures(&self) -> u64 {
+        0
+    }
 }
 
 /// Deterministic dictionary layer — the **guarantee**. Runs first, always.

@@ -86,6 +86,7 @@ pub struct Metrics {
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     store_terms: AtomicU64,
+    detector_errors: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -119,6 +120,7 @@ impl Metrics {
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             store_terms: AtomicU64::new(0),
+            detector_errors: AtomicU64::new(0),
         }
     }
 
@@ -171,6 +173,16 @@ impl Metrics {
         let mut g = self.lock();
         g.lock_wait_seconds.observe(lock_wait_seconds);
         g.scan_seconds.observe(scan_seconds);
+    }
+
+    /// The ML detector failed on `n` segments (they kept dictionary and regex coverage).
+    pub fn detector_errors(&self, n: u64) {
+        self.detector_errors.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Taught terms, for `/healthz` (read lock-free, so a probe never queues behind a scan).
+    pub fn store_terms(&self) -> u64 {
+        self.store_terms.load(Ordering::Relaxed)
     }
 
     pub fn set_store_terms(&self, n: usize) {
@@ -282,6 +294,17 @@ impl Metrics {
             o,
             "portcullis_delta_cache_total{{result=\"miss\"}} {}",
             self.cache_misses.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            o,
+            "# HELP portcullis_detector_errors_total Segments where the ML detector failed and only dictionary and regex coverage applied."
+        );
+        let _ = writeln!(o, "# TYPE portcullis_detector_errors_total counter");
+        let _ = writeln!(
+            o,
+            "portcullis_detector_errors_total {}",
+            self.detector_errors.load(Ordering::Relaxed)
         );
 
         for (name, help, h) in [

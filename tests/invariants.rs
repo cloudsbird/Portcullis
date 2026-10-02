@@ -150,3 +150,21 @@ fn longest_form_wins_at_the_same_position() {
     let out = gw.process(&["About Project Loki today.".to_string()]);
     assert!(out[0].contains("<<PROJECT_1>>"), "{}", out[0]);
 }
+
+/// The compiled-dictionary cache must never serve a stale list: `Gateway::store` is a
+/// public field, and a term added by editing it directly has to take effect at once.
+#[test]
+fn directly_edited_store_is_never_served_from_a_stale_dictionary() {
+    let mut gw = gw_with(&[("Cartalian", "ORG")]);
+    let first = gw.process(&["Loki and Cartalian".to_string()]);
+    assert!(first[0].contains("Loki"), "{}", first[0]);
+
+    gw.store.teach("Loki", "ORG", "global"); // bypasses Gateway::teach on purpose
+    let leaky = vec!["Loki is here".to_string()];
+    assert!(
+        gw.assert_clean(&leaky).is_err(),
+        "assert_clean used a stale dictionary"
+    );
+    let mut fresh = gw_with(&[("Cartalian", "ORG"), ("Loki", "ORG")]);
+    assert!(!fresh.process(&leaky)[0].contains("Loki"));
+}

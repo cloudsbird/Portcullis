@@ -208,3 +208,12 @@ Being precise here matters more than looking complete.
 
 The honest summary: **the guarantee layer works today; the convenience layers are
 roadmap.**
+
+## Teaching while the server runs
+
+Prefer teaching over HTTP (`/teach`) while `serve` is running: it takes effect on the next
+request. The CLI (`portcullis teach`) edits the file directly, and a running server does **not**
+re-read it — the term applies after a restart. It is no longer *lost*, though: every HTTP
+`teach`/`unteach` re-reads the store file first and writes back on top of it, so a term added
+by the CLI survives (and from that point the server has it too). The file read and write run
+off the gateway lock, so a teach — even with encryption on — does not stall other requests.

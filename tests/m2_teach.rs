@@ -317,3 +317,43 @@ async fn unteach_removes_term() {
 
     let _ = std::fs::remove_file(&store_path);
 }
+
+/// A term written to the store file out of band (the CLI, while the server runs) must
+/// survive the next HTTP teach instead of being overwritten from stale memory.
+#[tokio::test]
+async fn http_teach_keeps_terms_added_to_the_file_out_of_band() {
+    let store_path = temp_store_path();
+    let gw = Gateway::new(Store::default());
+    let upstream = "http://127.0.0.1:1/v1/chat/completions".to_string();
+    let mut state = ProxyState::new(gw, Client::new(), upstream, "key".into());
+    state.store_path = Some(store_path.clone());
+    state.admin_token = Some("secret-token".into());
+    let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
+    let base = base_url(&proxy_url);
+    let client = Client::new();
+
+    let teach = |term: &'static str| {
+        let req = client
+            .post(format!("{base}/teach"))
+            .bearer_auth("secret-token")
+            .json(&json!({"term": term, "label": "ORG"}));
+        async move { req.send().await.unwrap().status() }
+    };
+    assert!(teach("Aerolith").await.is_success());
+
+    // The CLI adds a term straight to the file.
+    let mut on_disk = Store::load(&store_path).unwrap();
+    on_disk.teach("FromTheCli", "ORG", "global");
+    on_disk.save(&store_path).unwrap();
+
+    assert!(teach("Cartalian").await.is_success());
+    let final_store = Store::load(&store_path).unwrap();
+    let terms: Vec<_> = final_store.deny.iter().map(|e| e.term.as_str()).collect();
+    assert!(
+        terms.contains(&"FromTheCli"),
+        "out-of-band term was overwritten: {terms:?}"
+    );
+    assert!(terms.contains(&"Aerolith") && terms.contains(&"Cartalian"));
+
+    let _ = std::fs::remove_file(&store_path);
+}

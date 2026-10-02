@@ -95,6 +95,56 @@ fn check_admin(state: &ProxyState, headers: &HeaderMap) -> Result<(), (StatusCod
     Ok(())
 }
 
+/// Apply `op` to the gateway and persist the result.
+///
+/// * **Read-modify-write against the file.** If the store file exists it is re-read
+///   first and becomes the starting point, so a term added out of band (`portcullis
+///   teach` while serving) is not silently overwritten by this write.
+/// * **Disk work off the gateway lock.** Reading and saving can run Argon2 (64 MiB) when
+///   encryption is on; doing that under the gateway lock would stall every request, so
+///   it runs on the blocking pool and the lock is held only for the in-memory change.
+/// * Writers are serialized by `store_write_lock`, so two teaches cannot interleave.
+///
+/// An unreadable store file (wrong key, corruption) fails the request instead of being
+/// overwritten.
+async fn mutate_store<T>(
+    state: &ProxyState,
+    op: impl FnOnce(&mut crate::Gateway) -> T,
+) -> Result<T, (StatusCode, String)> {
+    let internal = |e: String| (StatusCode::INTERNAL_SERVER_ERROR, e);
+    let _writer = state.store_write_lock.lock().await;
+    let path = store_path(state);
+
+    let on_disk = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            if std::path::Path::new(&path).exists() {
+                crate::Store::load(&path).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|e| internal(e.to_string()))?
+        .map_err(|e| internal(e.to_string()))?
+    };
+
+    let (result, snapshot) = {
+        let mut gw = state.gateway.lock().await;
+        if let Some(store) = on_disk {
+            gw.replace_store(store);
+        }
+        let result = op(&mut gw);
+        (result, gw.store.clone())
+    };
+
+    tokio::task::spawn_blocking(move || snapshot.save(&path))
+        .await
+        .map_err(|e| internal(e.to_string()))?
+        .map_err(|e| internal(e.to_string()))?;
+    Ok(result)
+}
+
 pub(super) async fn teach_handler(
     State(state): State<ProxyState>,
     headers: HeaderMap,
@@ -122,13 +172,21 @@ pub(super) async fn teach_handler(
             .into_response();
     }
 
-    let path = store_path(&state);
-    let mut gw = state.gateway.lock().await;
-    gw.teach_with(&req.term, &req.label, &req.scope, req.whole_word);
-    if let Err(e) = gw.store.save(&path) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-    let total = gw.store.deny.len();
+    let (term, label, scope, whole_word) = (
+        req.term.clone(),
+        req.label.clone(),
+        req.scope.clone(),
+        req.whole_word,
+    );
+    let total = match mutate_store(&state, move |gw| {
+        gw.teach_with(&term, &label, &scope, whole_word);
+        gw.store.deny.len()
+    })
+    .await
+    {
+        Ok(total) => total,
+        Err(e) => return e.into_response(),
+    };
     Json(json!({ "ok": true, "taught": req.term, "total": total })).into_response()
 }
 
@@ -141,12 +199,12 @@ pub(super) async fn unteach_handler(
         return e.into_response();
     }
 
-    let path = store_path(&state);
-    let mut gw = state.gateway.lock().await;
-    let removed = gw.unteach_in(&req.term, req.scope.as_deref());
-    if let Err(e) = gw.store.save(&path) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
+    let (term, scope) = (req.term.clone(), req.scope.clone());
+    let removed = match mutate_store(&state, move |gw| gw.unteach_in(&term, scope.as_deref())).await
+    {
+        Ok(removed) => removed,
+        Err(e) => return e.into_response(),
+    };
     Json(json!({ "ok": true, "removed": removed })).into_response()
 }
 

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -7,6 +8,37 @@ use crate::detect::{merge, Detector, DictionaryDetector, RegexDetector};
 use crate::metrics::Metrics;
 use crate::store::Store;
 use crate::vault::Vault;
+
+/// `scope -> (deny-list fingerprint, compiled dictionary)`.
+type DictCache = HashMap<Option<String>, (u64, Arc<DictionaryDetector>)>;
+
+/// Distinct scopes whose compiled dictionaries are kept (the scope set is configured, so
+/// this is only a backstop).
+const DICT_CACHE_LIMIT: usize = 64;
+
+/// A hash of everything in the deny-list that affects matching.
+fn deny_fingerprint(store: &Store) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for e in &store.deny {
+        (&e.term, &e.label, &e.scope, &e.aliases, e.whole_word).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Widen `start..end` outward to character boundaries and clamp to the segment.
+/// `None` only for an empty or out-of-range span. Widening, never dropping, is the
+/// safe direction: it can only hide more.
+fn snap_to_boundaries(seg: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    let mut start = start.min(seg.len());
+    let mut end = end.min(seg.len());
+    while !seg.is_char_boundary(start) {
+        start -= 1;
+    }
+    while !seg.is_char_boundary(end) {
+        end += 1;
+    }
+    (start < end).then_some((start, end))
+}
 
 /// Delta-cache size at which it is flushed, so a long-lived proxy cannot grow it
 /// without bound.
@@ -36,6 +68,9 @@ pub struct Gateway {
     /// Recent spans redacted by a non-dictionary detector (regex, ONNX, …).
     suggestions: VecDeque<(Option<String>, String)>,
     metrics: Arc<Metrics>,
+    /// Compiled dictionaries by scope, each tagged with the fingerprint of the deny-list
+    /// it was built from.
+    dicts: Mutex<DictCache>,
 }
 
 impl Gateway {
@@ -50,6 +85,7 @@ impl Gateway {
             extra: None,
             suggestions: VecDeque::new(),
             metrics,
+            dicts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -114,6 +150,37 @@ impl Gateway {
     /// gateway lock.
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
+    }
+
+    /// The compiled dictionary for `scope`, reused across requests.
+    ///
+    /// Compiling it is the expensive part of a dictionary scan (one regex over every
+    /// term), so it is cached. The cache is validated against a fingerprint of the
+    /// deny-list on every call, not invalidated by hooks: `store` is a public field and
+    /// can be edited directly, and a stale dictionary would silently miss a new term.
+    fn dictionary(&self, scope: Option<&str>) -> Arc<DictionaryDetector> {
+        let fingerprint = deny_fingerprint(&self.store);
+        let key = scope.map(str::to_string);
+        let mut cache = self.dicts.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((fp, dict)) = cache.get(&key) {
+            if *fp == fingerprint {
+                return dict.clone();
+            }
+        }
+        if cache.len() >= DICT_CACHE_LIMIT {
+            cache.clear();
+        }
+        let dict = Arc::new(DictionaryDetector::for_scope(&self.store, scope));
+        cache.insert(key, (fingerprint, dict.clone()));
+        dict
+    }
+
+    /// Replace the whole store (e.g. with a fresh read from disk). A policy change, so
+    /// the delta cache is cleared (invariant 3).
+    pub fn replace_store(&mut self, store: Store) {
+        self.store = store;
+        self.cache.clear();
+        self.metrics.set_store_terms(self.store.deny.len());
     }
 
     pub fn vault(&self) -> &Vault {
@@ -213,7 +280,17 @@ impl Gateway {
         let mut spans = dict.detect(seg);
         spans.extend(self.regexes.detect(seg));
         if let Some(extra) = &self.extra {
-            spans.extend(extra.detect(seg));
+            // A third-party detector's offsets are not trusted to land on character
+            // boundaries: slicing mid-character would panic, and a misaligned span
+            // would redact the wrong bytes. Widen to the enclosing boundaries.
+            spans.extend(extra.detect(seg).into_iter().filter_map(|mut s| {
+                (s.start, s.end) = snap_to_boundaries(seg, s.start, s.end)?;
+                Some(s)
+            }));
+            let failed = extra.take_failures();
+            if failed > 0 {
+                self.metrics.detector_errors(failed);
+            }
         }
         let mut kept = Vec::new();
         for s in merge(spans) {
@@ -273,7 +350,7 @@ impl Gateway {
             self.cache.clear();
         }
         // Compiled once per call, and only if some segment misses the cache.
-        let mut dict: Option<DictionaryDetector> = None;
+        let mut dict: Option<Arc<DictionaryDetector>> = None;
         let (mut hits, mut misses) = (0u64, 0u64);
         let mut out = Vec::with_capacity(segments.len());
         for seg in segments {
@@ -285,9 +362,8 @@ impl Gateway {
                 }
                 None => {
                     misses += 1;
-                    let dict = dict
-                        .get_or_insert_with(|| DictionaryDetector::for_scope(&self.store, scope));
-                    let spans = self.detect_spans(scope, dict, seg);
+                    let dict = dict.get_or_insert_with(|| self.dictionary(scope)).clone();
+                    let spans = self.detect_spans(scope, &dict, seg);
                     self.cache.insert(h, spans.clone());
                     spans
                 }
@@ -317,18 +393,31 @@ impl Gateway {
     }
 
     /// [`Gateway::assert_clean`] for a request in `scope`.
-    pub fn assert_clean_scoped(
+    /// Only the taught-term half of [`Gateway::assert_clean_scoped`]. For checking the
+    /// individual strings of a JSON body, where "<<" without ">>" is just prose.
+    pub fn assert_no_terms_scoped(
         &self,
         scope: Option<&str>,
-        outbound: &[String],
+        segments: &[String],
     ) -> Result<(), String> {
-        let dict = DictionaryDetector::for_scope(&self.store, scope);
-        for seg in outbound {
+        let dict = self.dictionary(scope);
+        for seg in segments {
             for span in dict.detect(seg) {
                 if !self.store.is_allowed_for(scope, &seg[span.start..span.end]) {
                     return Err("residual protected term in outbound".into());
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub fn assert_clean_scoped(
+        &self,
+        scope: Option<&str>,
+        outbound: &[String],
+    ) -> Result<(), String> {
+        self.assert_no_terms_scoped(scope, outbound)?;
+        for seg in outbound {
             if seg.contains("<<") && !seg.contains(">>") {
                 return Err("malformed placeholder in outbound".into());
             }
@@ -345,6 +434,27 @@ impl Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Misaligned;
+    impl Detector for Misaligned {
+        // Byte 1 is inside the 2-byte "é"; byte 4 is inside the 3-byte "€".
+        fn detect(&self, _text: &str) -> Vec<crate::detect::Span> {
+            vec![crate::detect::Span {
+                start: 1,
+                end: 4,
+                label: "PERSON".into(),
+                source: "onnx",
+                score: 0.9,
+            }]
+        }
+    }
+
+    #[test]
+    fn a_misaligned_detector_span_is_widened_not_panicked_on_or_dropped() {
+        let mut gw = Gateway::new(Store::default()).with_detector(Box::new(Misaligned));
+        let out = gw.process(&["é€x".to_string()]);
+        assert_eq!(out[0], "<<PERSON_1>>x", "{:?}", out[0]);
+    }
 
     #[test]
     fn suggestions_are_deduplicated_and_bounded() {
