@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+
+# The entity store is the crown jewels — never commit it.
+store.json
+*.secret
+.env
+.vault/

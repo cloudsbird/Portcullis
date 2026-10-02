@@ -1,0 +1,22 @@
+[package]
+name = "portcullis"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first, teachable PII gateway — redact before the cloud LLM ever sees it."
+license = "Apache-2.0"
+repository = "https://github.com/cloudsbird/Portcullis"
+keywords = ["pii", "privacy", "llm", "redaction", "security"]
+categories = ["security", "command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+lto = true
+strip = true
