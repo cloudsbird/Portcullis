@@ -122,6 +122,59 @@ The model's recall is a safety net; teaching converts a lucky guess into a guara
 - **`store.json` is the crown jewels.** It is a map of everything you consider private.
   It is `.gitignore`d by default. Keep it that way.
 
+## How matching actually works (measured)
+
+Worth knowing before you rely on it, because the behaviour is simpler — and in two places
+blunter — than you might assume. Reproduce everything below with
+[`scripts/teach_demo.sh`](../scripts/teach_demo.sh).
+
+**It is an exact, case-insensitive substring match.** Teaching `Cartalian` matches
+`cartalian`, `CARTALIAN`, `Cartalian's` and `Cartalian Inc.`, because the search is a plain
+`find` over the lowercased text.
+
+### Three consequences
+
+**1. There are no word boundaries, so short terms over-match.** Teaching `Ann` rewrites
+`Announcement` and `Annual`:
+
+```
+-- what the cloud model sees --
+<<PERSON_1>> is the contact. See the <<PERSON_1>>ouncement and the <<PERSON_1>>ual report.
+-- rehydrated (what you see) --
+Ann is the contact. See the Announcement and the Annual report.
+```
+
+Your client gets the right text back, but the **provider receives a mangled prompt** — "the
+`<<PERSON_1>>ouncement`" is not a word, which degrades the answer the model can give even
+though nothing leaked. Until this is fixed, teach distinctive strings rather than short
+common ones.
+
+**2. The detector's *labels* are unreliable, though the redaction is still correct.** With
+an empty store, one test sentence came out as:
+
+```
+Hi, I'm <<FULL_NAME_1>> from <<CITY_1>>. Email <<EMAIL_1>>, card <<PHONE_1>>.
+```
+
+Everything was caught — but a company was labelled a **city**, and a card number was
+labelled a **phone**. Rehydration is keyed by the placeholder rather than the label, so the
+round trip is still exact. The label is what appears in logs and in the model's context, so
+treat it as cosmetic and teach the ones you care about.
+
+**3. The same value in different cases gets different placeholders.** `Cartalian`,
+`cartalian` and `CARTALIAN` became `<<ORG_1>>`, `<<ORG_2>>`, `<<ORG_3>>` — the vault keys on
+the exact matched bytes. Harmless for correctness; slightly worse for prompt-cache reuse,
+and it makes one entity look like three to the model.
+
+### What that means for what you teach
+
+- **Teach the distinctive form**: `Cartalian`, not `Ann`.
+- **Teach the variants you care about.** There is no alias or abbreviation inference — `CTL`
+  is not caught by teaching `Cartalian`. The store schema has an `aliases` field, but nothing
+  populates it yet.
+- **The model generalises; teaching does not.** Teaching is exact-string memorisation and
+  will never infer "things like this".
+
 ## What teaching does NOT do
 
 Being precise here matters more than looking complete.

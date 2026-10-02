@@ -137,7 +137,10 @@ async fn main() -> Result<()> {
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
 
-    let filter = EnvFilter::try_from_env("PORTCULLIS_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    // `ort` logs every graph-optimisation step at INFO — hundreds of kilobytes per
+    // model load, which buries the request log. Silenced unless asked for.
+    let filter = EnvFilter::try_from_env("PORTCULLIS_LOG")
+        .unwrap_or_else(|_| EnvFilter::new("info,ort=warn"));
     let want_json = std::env::var("PORTCULLIS_LOG_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
