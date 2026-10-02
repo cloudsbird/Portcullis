@@ -15,6 +15,7 @@
 
 pub mod detect;
 pub mod pipeline;
+pub mod proxy;
 pub mod store;
 pub mod vault;
 

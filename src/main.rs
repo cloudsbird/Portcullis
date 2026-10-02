@@ -28,20 +28,29 @@ enum Command {
     Unteach { term: String },
     /// Redact a message and show exactly what the cloud model would see.
     Scan { text: String },
+    /// Run the OpenAI-compatible proxy server.
+    Serve {
+        /// Address to bind on.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: String,
+    },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     let store = Store::load(&cli.store)?;
-    let mut gw = Gateway::new(store);
+    let gw = Gateway::new(store);
 
     match cli.command {
         Command::Teach { term, label } => {
+            let mut gw = gw;
             gw.teach(&term, &label, "global");
             gw.store.save(&cli.store)?;
             println!("taught: {term} ({label})");
         }
         Command::Unteach { term } => {
+            let mut gw = gw;
             if gw.unteach(&term) {
                 gw.store.save(&cli.store)?;
                 println!("unteached: {term}");
@@ -50,12 +59,16 @@ fn main() -> Result<()> {
             }
         }
         Command::Scan { text } => {
+            let mut gw = gw;
             let out = gw.process(std::slice::from_ref(&text));
             gw.assert_clean(&out).map_err(|e| anyhow::anyhow!(e))?;
             println!("-- what the cloud model sees --");
             println!("{}", out[0]);
             println!("-- rehydrated (what you see) --");
             println!("{}", gw.rehydrate(&out[0]));
+        }
+        Command::Serve { bind } => {
+            portcullis::proxy::serve(gw, &bind).await?;
         }
     }
     Ok(())
