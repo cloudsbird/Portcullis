@@ -16,10 +16,11 @@ onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 anyhow = "1"
 axum = "0.7"
 clap = { version = "4", features = ["derive"] }
+futures = "0.3"
 hex = "0.4"
 ndarray = { version = "0.17", optional = true }
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

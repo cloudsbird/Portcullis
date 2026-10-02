@@ -5,16 +5,19 @@
 //! provider, and rehydrates the assistant reply before returning it.
 
 use axum::{
+    body::{Body, Bytes},
     extract::State,
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use futures::stream::{Stream, TryStreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -195,6 +198,11 @@ async fn handle(state: ProxyState, body: Value) -> Result<Response, (StatusCode,
             .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     }
 
+    let streaming = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let upstream_resp = state
         .client
         .post(&state.upstream_url)
@@ -203,6 +211,10 @@ async fn handle(state: ProxyState, body: Value) -> Result<Response, (StatusCode,
         .send()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    if streaming {
+        return stream_response(state, upstream_resp).await;
+    }
 
     let status = upstream_resp.status();
     let mut upstream_json: Value = upstream_resp
@@ -226,6 +238,233 @@ async fn handle(state: ProxyState, body: Value) -> Result<Response, (StatusCode,
     }
 
     Ok((status, Json(upstream_json)).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Server-Sent Events streaming path
+// ---------------------------------------------------------------------------
+
+/// Forward a streaming upstream response to the caller, rehydrating every
+/// `data:` line chunk by chunk while buffering incomplete SSE events so that
+/// placeholders split across TCP chunks are still restored correctly.
+async fn stream_response(
+    state: ProxyState,
+    upstream_resp: reqwest::Response,
+) -> Result<Response, (StatusCode, String)> {
+    let status = upstream_resp.status();
+    let content_type = upstream_resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .cloned();
+
+    let gw = state.gateway.clone();
+    let bytes_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
+        Box::pin(upstream_resp.bytes_stream());
+
+    let stream = futures::stream::try_unfold(
+        (String::new(), StreamCarry::default(), bytes_stream, gw),
+        |(mut buf, mut carry, mut stream, gw)| async move {
+            loop {
+                // Emit a complete SSE event as soon as we have the blank-line
+                // delimiter. `carry` additionally holds back a partial
+                // placeholder that spans two events.
+                if let Some(event_end) = buf.find("\n\n") {
+                    let after = buf.split_off(event_end + 2);
+                    let event = std::mem::replace(&mut buf, after);
+                    let processed = process_sse_event(&event, &mut carry, &gw).await;
+                    return Ok::<_, std::io::Error>(Some((
+                        Bytes::from(processed),
+                        (buf, carry, stream, gw),
+                    )));
+                }
+
+                match stream.try_next().await {
+                    Ok(Some(chunk)) => {
+                        buf.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                    Ok(None) => {
+                        let mut tail = if buf.is_empty() {
+                            String::new()
+                        } else {
+                            let processed = process_sse_event(&buf, &mut carry, &gw).await;
+                            buf.clear();
+                            processed
+                        };
+                        tail.push_str(&flush_carry(&mut carry, &gw).await);
+                        if tail.is_empty() {
+                            return Ok(None);
+                        }
+                        return Ok(Some((Bytes::from(tail), (buf, carry, stream, gw))));
+                    }
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e,
+                        ));
+                    }
+                }
+            }
+        },
+    );
+
+    let mut builder = Response::builder().status(status);
+    if let Some(ct) = content_type {
+        builder = builder.header(axum::http::header::CONTENT_TYPE, ct.as_bytes());
+    }
+    builder
+        .body(Body::from_stream(stream))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Placeholder-level carry buffer for the SSE path
+// ---------------------------------------------------------------------------
+
+/// Upper bound on how much of a suspected partial placeholder we hold back.
+/// Guarantees a malformed stream can never grow the buffer without bound.
+const MAX_PENDING: usize = 256;
+
+/// Per-field carry buffers, so a partial placeholder in `content` and one in
+/// tool-call `arguments` cannot corrupt each other.
+#[derive(Default)]
+struct StreamCarry {
+    content: String,
+    args: String,
+}
+
+/// Split `combined` into (safe to emit, holds back a partial placeholder).
+///
+/// A placeholder looks like `<<LABEL_N>>`. If the text ends with a `<<` that
+/// has no closing `>>` after it, everything from that `<<` onward is withheld
+/// until a later event completes it.
+fn split_partial_placeholder(combined: &str) -> (&str, &str) {
+    if let Some(open) = combined.rfind("<<") {
+        if !combined[open + 2..].contains(">>") {
+            return (&combined[..open], &combined[open..]);
+        }
+    }
+    (combined, "")
+}
+
+/// Rehydrate `text`, prepending and updating the carry buffer so a placeholder
+/// split across events is restored as a single unit.
+fn rehydrate_with_carry(text: &str, pending: &mut String, gw: &Gateway) -> String {
+    let combined = format!("{pending}{text}");
+    let (emit, held) = split_partial_placeholder(&combined);
+    let (emit, held) = if held.len() > MAX_PENDING {
+        // Give up holding rather than buffer unboundedly.
+        (combined.as_str(), "")
+    } else {
+        (emit, held)
+    };
+    let emit_owned = emit.to_string();
+    *pending = held.to_string();
+    gw.rehydrate(&emit_owned)
+}
+
+/// Emit any held-back text as a final synthetic delta event.
+async fn flush_carry(carry: &mut StreamCarry, gw: &Arc<Mutex<Gateway>>) -> String {
+    if carry.content.is_empty() && carry.args.is_empty() {
+        return String::new();
+    }
+    let gw_guard = gw.lock().await;
+    let mut deltas = Vec::new();
+    if !carry.content.is_empty() {
+        let held = std::mem::take(&mut carry.content);
+        deltas.push(json!({
+            "index": 0,
+            "delta": { "content": gw_guard.rehydrate(&held) },
+            "finish_reason": null
+        }));
+    }
+    if !carry.args.is_empty() {
+        let held = std::mem::take(&mut carry.args);
+        deltas.push(json!({
+            "index": 0,
+            "delta": { "tool_calls": [ {
+                "index": 0,
+                "function": { "arguments": gw_guard.rehydrate(&held) }
+            } ] },
+            "finish_reason": null
+        }));
+    }
+    let payload = json!({ "object": "chat.completion.chunk", "choices": deltas });
+    format!("data: {payload}\n\n")
+}
+
+/// Rehydrate the text-bearing fields inside one SSE event.
+///
+/// `carry` holds back a partial placeholder that spans two events; it is
+/// flushed before `[DONE]` and again at end of stream.
+async fn process_sse_event(
+    event: &str,
+    carry: &mut StreamCarry,
+    gw: &Arc<Mutex<Gateway>>,
+) -> String {
+    let mut out = String::new();
+    for line in event.lines() {
+        if let Some(payload) = line.strip_prefix("data: ") {
+            if payload == "[DONE]" {
+                // Flush anything still held back before terminating.
+                out.push_str(&flush_carry(carry, gw).await);
+                out.push_str(line);
+            } else {
+                match serde_json::from_str::<Value>(payload) {
+                    Ok(mut value) => {
+                        rehydrate_sse_delta(&mut value, carry, gw).await;
+                        out.push_str("data: ");
+                        match serde_json::to_string(&value) {
+                            Ok(serialized) => out.push_str(&serialized),
+                            Err(_) => out.push_str(payload),
+                        }
+                    }
+                    Err(_) => out.push_str(line),
+                }
+            }
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    // Each SSE event is terminated by a blank line.
+    out.push('\n');
+    out
+}
+
+/// Apply `Gateway::rehydrate` to every text-bearing delta field in a streaming
+/// chunk: `choices[].delta.content` and `choices[].delta.tool_calls[].function.arguments`.
+async fn rehydrate_sse_delta(
+    value: &mut Value,
+    carry: &mut StreamCarry,
+    gw: &Arc<Mutex<Gateway>>,
+) {
+    let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    let gw_guard = gw.lock().await;
+    for choice in choices.iter_mut() {
+        let Some(delta) = choice.get_mut("delta") else {
+            continue;
+        };
+        if let Some(Value::String(content)) = delta.get_mut("content") {
+            let rehydrated = rehydrate_with_carry(content, &mut carry.content, &gw_guard);
+            *content = rehydrated;
+        }
+        if let Some(tool_calls) = delta.get_mut("tool_calls") {
+            rehydrate_tool_calls(tool_calls, &mut carry.args, &gw_guard);
+        }
+    }
+}
+
+fn rehydrate_tool_calls(tool_calls: &mut Value, pending: &mut String, gw: &Gateway) {
+    let Some(calls) = tool_calls.as_array_mut() else { return };
+    for call in calls.iter_mut() {
+        let Some(func) = call.get_mut("function") else { continue };
+        if let Some(Value::String(args)) = func.get_mut("arguments") {
+            let rehydrated = rehydrate_with_carry(args, pending, gw);
+            *args = rehydrated;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
