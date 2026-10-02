@@ -267,10 +267,9 @@ async fn metrics_handler(State(state): State<ProxyState>, headers: HeaderMap) ->
 /// Liveness and readiness probe. Unauthenticated, and deliberately reports only
 /// counts — never a term, a value or a key.
 async fn healthz(State(state): State<ProxyState>) -> Json<Value> {
-    let store_terms = {
-        let gw = state.gateway.lock().await;
-        gw.store.deny.len()
-    };
+    // Lock-free on purpose: scans serialize and can take seconds, and a liveness probe
+    // that queues behind one gets a healthy process restarted.
+    let store_terms = state.metrics.store_terms();
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),

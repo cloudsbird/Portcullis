@@ -8,6 +8,21 @@ use crate::metrics::Metrics;
 use crate::store::Store;
 use crate::vault::Vault;
 
+/// Widen `start..end` outward to character boundaries and clamp to the segment.
+/// `None` only for an empty or out-of-range span. Widening, never dropping, is the
+/// safe direction: it can only hide more.
+fn snap_to_boundaries(seg: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    let mut start = start.min(seg.len());
+    let mut end = end.min(seg.len());
+    while !seg.is_char_boundary(start) {
+        start -= 1;
+    }
+    while !seg.is_char_boundary(end) {
+        end += 1;
+    }
+    (start < end).then_some((start, end))
+}
+
 /// Delta-cache size at which it is flushed, so a long-lived proxy cannot grow it
 /// without bound.
 const CACHE_LIMIT: usize = 20_000;
@@ -213,7 +228,17 @@ impl Gateway {
         let mut spans = dict.detect(seg);
         spans.extend(self.regexes.detect(seg));
         if let Some(extra) = &self.extra {
-            spans.extend(extra.detect(seg));
+            // A third-party detector's offsets are not trusted to land on character
+            // boundaries: slicing mid-character would panic, and a misaligned span
+            // would redact the wrong bytes. Widen to the enclosing boundaries.
+            spans.extend(extra.detect(seg).into_iter().filter_map(|mut s| {
+                (s.start, s.end) = snap_to_boundaries(seg, s.start, s.end)?;
+                Some(s)
+            }));
+            let failed = extra.take_failures();
+            if failed > 0 {
+                self.metrics.detector_errors(failed);
+            }
         }
         let mut kept = Vec::new();
         for s in merge(spans) {
@@ -345,6 +370,27 @@ impl Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Misaligned;
+    impl Detector for Misaligned {
+        // Byte 1 is inside the 2-byte "é"; byte 4 is inside the 3-byte "€".
+        fn detect(&self, _text: &str) -> Vec<crate::detect::Span> {
+            vec![crate::detect::Span {
+                start: 1,
+                end: 4,
+                label: "PERSON".into(),
+                source: "onnx",
+                score: 0.9,
+            }]
+        }
+    }
+
+    #[test]
+    fn a_misaligned_detector_span_is_widened_not_panicked_on_or_dropped() {
+        let mut gw = Gateway::new(Store::default()).with_detector(Box::new(Misaligned));
+        let out = gw.process(&["é€x".to_string()]);
+        assert_eq!(out[0], "<<PERSON_1>>x", "{:?}", out[0]);
+    }
 
     #[test]
     fn suggestions_are_deduplicated_and_bounded() {

@@ -66,6 +66,28 @@ async fn healthz_is_available_and_leaks_nothing() {
     );
 }
 
+/// A liveness probe must not queue behind a long scan: hold the gateway lock (as a slow
+/// detection does) and `/healthz` must still answer promptly.
+#[tokio::test]
+async fn healthz_does_not_wait_for_the_gateway_lock() {
+    let state = proxy_state(
+        Duration::from_secs(5),
+        "http://127.0.0.1:1/v1/chat/completions".into(),
+    );
+    let gateway = state.gateway.clone();
+    let base = spawn(app(state)).await;
+
+    let _held = gateway.lock().await;
+    let resp = tokio::time::timeout(
+        Duration::from_secs(2),
+        reqwest::get(format!("{base}/healthz")),
+    )
+    .await
+    .expect("/healthz blocked behind the gateway lock")
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
 /// An oversized request body is refused before it can reach the detector.
 #[tokio::test]
 async fn oversized_body_is_rejected() {
