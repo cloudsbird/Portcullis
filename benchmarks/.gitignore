@@ -1,0 +1,2 @@
+# Local cache for benchmark datasets (downloaded on demand).
+.cache/
