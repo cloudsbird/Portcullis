@@ -326,7 +326,7 @@ invalidation, rehydration, fail-closed — which is what `tests/invariants.rs` c
 
 Usable today for a single user, on loopback, in front of your own traffic.
 
-**Verified:** 40 tests by default (**41** with `--features onnx`), run on every push. The
+**Verified:** 86 tests by default (**89** with `--features onnx`), run on every push. The
 safety contract in `tests/invariants.rs`, the OpenAI and Anthropic proxy paths, SSE
 streaming including placeholders split across events, the hardening surface (timeouts,
 body limits, health, store permissions), and a golden test proving the Rust ONNX detector
@@ -412,9 +412,9 @@ Issues and pull requests are welcome. For anything substantial, please open an i
 first so the approach can be agreed before code is written.
 
 ```bash
-cargo test                                  # 40 tests
+cargo test                                  # 86 tests
 cargo build --features onnx
-PORTCULLIS_MODEL_DIR=./model cargo test --features onnx    # 41
+PORTCULLIS_MODEL_DIR=./model cargo test --features onnx    # 89
 ```
 
 Two conventions worth knowing before you send a patch:

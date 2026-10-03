@@ -28,11 +28,25 @@ jobs:
   audit:
     name: dependency advisories
     runs-on: ubuntu-latest
+    # The action posts its result as a check run, which needs `checks: write`.
+    # Without it the job fails with "Resource not accessible by integration"
+    # regardless of what the audit found. `contents: read` is required for
+    # checkout once any permissions block is present.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # These two are *informational* "unmaintained" notices, not
+          # vulnerabilities, for crates `tokenizers` pulls in transitively and we
+          # cannot replace. Neither has a known security issue:
+          #   RUSTSEC-2024-0436   paste          (repository archived)
+          #   RUSTSEC-2025-0119   number_prefix  (no longer maintained)
+          # Revisit when tokenizers drops them. Anything else still fails the job.
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2025-0119
 
   default:
     name: default (no ML deps)

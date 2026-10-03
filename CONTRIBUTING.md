@@ -45,9 +45,9 @@ Most of the test suite does not need it.
 ## Running the tests
 
 ```bash
-cargo test                                                  # 40 tests, no model required
+cargo test                                                  # 86 tests, no model required
 cargo build --features onnx
-PORTCULLIS_MODEL_DIR=./model cargo test --features onnx     # 41, includes the golden test
+PORTCULLIS_MODEL_DIR=./model cargo test --features onnx     # 89, includes the golden test
 ```
 
 `cargo test` must be green in **both** configurations before a patch is mergeable. CI runs
