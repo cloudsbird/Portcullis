@@ -214,6 +214,8 @@ pub(super) async fn handle_anthropic(
     // Who is asking decides which taught terms apply. Rejected before any body is
     // read or forwarded.
     let scope = resolve_scope(&state, &headers)?;
+    // Transparent mode: forward to the endpoint the client actually called.
+    let target = passthrough_target(&state, &headers)?;
 
     // Collect every redactable string while preserving all other fields.
     let mut redacted_body = body.clone();
@@ -271,14 +273,26 @@ pub(super) async fn handle_anthropic(
         .map(|s| s.to_string())
         .unwrap_or_else(|| state.anthropic_version.clone());
 
-    let upstream_resp = send_upstream(&state, streaming, &headers, || {
-        state
-            .client
-            .post(&state.anthropic_upstream_url)
-            .header("x-api-key", &state.anthropic_upstream_key)
-            .header("anthropic-version", &version)
-            .header("content-type", "application/json")
-            .json(&redacted_body)
+    let upstream_resp = send_upstream(&state, streaming, &headers, target.is_some(), || {
+        match &target {
+            // The client's own x-api-key / anthropic-version headers are forwarded
+            // by send_upstream; only fill in a version if the client sent none.
+            Some(url) => {
+                let rb = state.client.post(url);
+                if headers.contains_key("anthropic-version") {
+                    rb
+                } else {
+                    rb.header("anthropic-version", &version)
+                }
+            }
+            None => state
+                .client
+                .post(&state.anthropic_upstream_url)
+                .header("x-api-key", &state.anthropic_upstream_key)
+                .header("anthropic-version", &version),
+        }
+        .header("content-type", "application/json")
+        .json(&redacted_body)
     })
     .await?;
 

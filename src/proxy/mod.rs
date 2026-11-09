@@ -76,6 +76,13 @@ pub struct ProxyState {
     /// Serializes teach/unteach so their read-modify-write of the store file cannot
     /// interleave. Held across disk I/O, which is why it is not the gateway lock.
     pub store_write_lock: Arc<Mutex<()>>,
+    /// Transparent mode (`PORTCULLIS_PASSTHROUGH`): a request may name its own
+    /// upstream in [`UPSTREAM_HEADER`] and is forwarded there with the client's own
+    /// credentials and headers. See [`passthrough_target`].
+    pub passthrough: bool,
+    /// Optional host allowlist for passthrough targets (`PORTCULLIS_PASSTHROUGH_HOSTS`),
+    /// lowercased. Empty: any host. An entry matches the host or any subdomain of it.
+    pub passthrough_hosts: Vec<String>,
 }
 
 impl ProxyState {
@@ -104,6 +111,8 @@ impl ProxyState {
             metrics,
             metrics_token: None,
             store_write_lock: Arc::new(Mutex::new(())),
+            passthrough: false,
+            passthrough_hosts: Vec::new(),
         }
     }
 }
@@ -155,6 +164,84 @@ fn parse_extra_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
     }
 }
 
+/// Header naming the real upstream endpoint in passthrough mode. Never forwarded.
+pub const UPSTREAM_HEADER: &str = "x-portcullis-upstream";
+
+/// Client headers never copied upstream in passthrough mode: hop-by-hop headers,
+/// headers reqwest computes itself, and our own control header. `accept-encoding`
+/// is dropped because the body is parsed here, so it must arrive uncompressed.
+const PASSTHROUGH_SKIP_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "content-type",
+    "connection",
+    "keep-alive",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "accept-encoding",
+    UPSTREAM_HEADER,
+];
+
+/// Resolve the per-request upstream in passthrough mode.
+///
+/// * No [`UPSTREAM_HEADER`]: `Ok(None)` — use the configured upstream.
+/// * Header present but passthrough disabled: rejected, rather than silently sending
+///   the request to a different provider than the client asked for.
+/// * Otherwise the URL must be http(s) and, if an allowlist is configured, on it.
+pub(super) fn passthrough_target(
+    state: &ProxyState,
+    headers: &HeaderMap,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let Some(raw) = headers.get(UPSTREAM_HEADER) else {
+        return Ok(None);
+    };
+    if !state.passthrough {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{UPSTREAM_HEADER} was sent but PORTCULLIS_PASSTHROUGH is not enabled"),
+        ));
+    }
+    let raw = raw.to_str().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("{UPSTREAM_HEADER} is not valid text"),
+        )
+    })?;
+    let url = reqwest::Url::parse(raw.trim()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("{UPSTREAM_HEADER} is not a URL: {e}"),
+        )
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{UPSTREAM_HEADER} must be an http(s) URL"),
+        ));
+    }
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    if host.is_empty() || !host_allowed(&host, &state.passthrough_hosts) {
+        state.metrics.blocked("passthrough_host");
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("upstream host '{host}' is not in PORTCULLIS_PASSTHROUGH_HOSTS"),
+        ));
+    }
+    Ok(Some(url.to_string()))
+}
+
+/// `true` when `allow` is empty, or `host` equals or is a subdomain of an entry.
+fn host_allowed(host: &str, allow: &[String]) -> bool {
+    allow.is_empty()
+        || allow
+            .iter()
+            .any(|a| host == a || host.ends_with(&format!(".{a}")))
+}
+
 /// Parse a positive integer number of seconds from the environment.
 fn env_secs(key: &str, default: u64) -> Duration {
     Duration::from_secs(
@@ -176,6 +263,7 @@ async fn send_upstream(
     state: &ProxyState,
     streaming: bool,
     client_headers: &HeaderMap,
+    passthrough: bool,
     build: impl Fn() -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, (StatusCode, String)> {
     let mut attempt = 0;
@@ -189,12 +277,23 @@ async fn send_upstream(
             request = request.header(name.as_str(), value.as_str());
         }
 
-        // Opt-in pass-through of client headers. Nothing is forwarded unless it
-        // was explicitly listed, so an unrelated credential cannot ride along.
-        for name in &state.forward_headers {
-            if let Some(value) = client_headers.get(name.as_str()) {
-                if let Ok(value) = value.to_str() {
-                    request = request.header(name.as_str(), value);
+        if passthrough {
+            // Transparent mode: the client is talking to its own provider with its
+            // own credentials, so its headers go along as sent (minus hop-by-hop
+            // and our control header).
+            for (name, value) in client_headers {
+                if !PASSTHROUGH_SKIP_HEADERS.contains(&name.as_str()) {
+                    request = request.header(name, value);
+                }
+            }
+        } else {
+            // Opt-in pass-through of client headers. Nothing is forwarded unless it
+            // was explicitly listed, so an unrelated credential cannot ride along.
+            for name in &state.forward_headers {
+                if let Some(value) = client_headers.get(name.as_str()) {
+                    if let Ok(value) = value.to_str() {
+                        request = request.header(name.as_str(), value);
+                    }
                 }
             }
         }
@@ -318,10 +417,30 @@ pub fn app(state: ProxyState) -> Router {
 /// https://api.anthropic.com/v1/messages), `PORTCULLIS_ANTHROPIC_KEY`, and
 /// `PORTCULLIS_ANTHROPIC_VERSION` (default 2023-06-01).
 pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
-    let upstream_url = std::env::var("PORTCULLIS_UPSTREAM_URL")
-        .map_err(|_| anyhow::anyhow!("PORTCULLIS_UPSTREAM_URL is not set"))?;
-    // Accept a base URL or a full endpoint — see normalize_chat_url.
-    let upstream_url = normalize_chat_url(&upstream_url);
+    let passthrough = matches!(
+        std::env::var("PORTCULLIS_PASSTHROUGH")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    );
+    let passthrough_hosts: Vec<String> = std::env::var("PORTCULLIS_PASSTHROUGH_HOSTS")
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // In passthrough mode every request can name its own upstream, so a default is
+    // optional; requests without the header then get a clear 400 instead.
+    let upstream_url = match std::env::var("PORTCULLIS_UPSTREAM_URL") {
+        Ok(u) if !u.trim().is_empty() => normalize_chat_url(&u),
+        _ if passthrough => String::new(),
+        _ => anyhow::bail!("PORTCULLIS_UPSTREAM_URL is not set"),
+    };
     let upstream_key = std::env::var("PORTCULLIS_UPSTREAM_KEY").unwrap_or_default();
     let store_path = std::env::var("PORTCULLIS_STORE").unwrap_or_else(|_| "store.json".into());
     let admin_token = std::env::var("PORTCULLIS_ADMIN_TOKEN").unwrap_or_default();
@@ -384,6 +503,22 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
         }
     }
 
+    let addr: SocketAddr = bind.parse()?;
+    if passthrough {
+        if !scope_tokens.is_empty() {
+            anyhow::bail!(
+                "PORTCULLIS_PASSTHROUGH cannot be combined with scope tokens: passthrough forwards the client's Authorization header, which carries the scope token"
+            );
+        }
+        // Reachable from other machines + any upstream = an open proxy. Require an
+        // explicit allowlist before allowing that combination.
+        if !addr.ip().is_loopback() && passthrough_hosts.is_empty() {
+            anyhow::bail!(
+                "PORTCULLIS_PASSTHROUGH on a non-loopback bind ({addr}) requires PORTCULLIS_PASSTHROUGH_HOSTS"
+            );
+        }
+    }
+
     let client = Client::builder()
         .use_rustls_tls()
         .connect_timeout(connect_timeout)
@@ -404,7 +539,8 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
     state.anthropic_upstream_url = anthropic_upstream_url;
     state.anthropic_upstream_key = anthropic_upstream_key;
     state.anthropic_version = anthropic_version;
-    let addr: SocketAddr = bind.parse()?;
+    state.passthrough = passthrough;
+    state.passthrough_hosts = passthrough_hosts;
     let listener = TcpListener::bind(addr).await?;
 
     // Say plainly where traffic is going. The single most common deployment
@@ -420,6 +556,8 @@ pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
         store_encrypted = crate::Store::is_encrypted(state.store_path.as_deref().unwrap_or("store.json")),
         scopes = state.scope_tokens.len(),
         metrics_auth = state.metrics_token.is_some(),
+        passthrough = state.passthrough,
+        passthrough_hosts = ?state.passthrough_hosts,
         "portcullis listening"
     );
 

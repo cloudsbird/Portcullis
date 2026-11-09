@@ -135,6 +135,14 @@ pub(super) async fn handle(
     // Who is asking decides which taught terms apply. Rejected before any body is
     // read or forwarded.
     let scope = resolve_scope(&state, &headers)?;
+    // Transparent mode: forward to the endpoint the client actually called.
+    let target = passthrough_target(&state, &headers)?;
+    if target.is_none() && state.upstream_url.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("no upstream: set PORTCULLIS_UPSTREAM_URL or send {UPSTREAM_HEADER}"),
+        ));
+    }
 
     let messages = body.get("messages").and_then(|m| m.as_array()).ok_or((
         StatusCode::BAD_REQUEST,
@@ -202,12 +210,16 @@ pub(super) async fn handle(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let upstream_resp = send_upstream(&state, streaming, &headers, || {
-        state
-            .client
-            .post(&state.upstream_url)
-            .bearer_auth(&state.upstream_key)
-            .json(&upstream_body)
+    let upstream_resp = send_upstream(&state, streaming, &headers, target.is_some(), || {
+        match &target {
+            // The client's own Authorization header is forwarded by send_upstream.
+            Some(url) => state.client.post(url),
+            None => state
+                .client
+                .post(&state.upstream_url)
+                .bearer_auth(&state.upstream_key),
+        }
+        .json(&upstream_body)
     })
     .await?;
 

@@ -253,6 +253,7 @@ Everything is environment variables. The ones that matter most:
 | `PORTCULLIS_THRESHOLD` | `0.5` | detector confidence cut-off |
 | `PORTCULLIS_LOG_FORMAT` | text | `json` for structured logs |
 | `PORTCULLIS_METRICS_TOKEN` | — | require a bearer token on `/metrics` (default: open) |
+| `PORTCULLIS_PASSTHROUGH` | off | transparent mode: a request may name its real upstream in `x-portcullis-upstream` and is forwarded with the client's own credentials ([CLIENTS.md](docs/CLIENTS.md#transparent-passthrough)) |
 
 Full reference, including timeouts, body limits, header forwarding and the health
 endpoint: [docs/OPERATIONS.md](docs/OPERATIONS.md). Provider-by-provider setup:

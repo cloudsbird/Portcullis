@@ -96,6 +96,36 @@ on the **very next** request — including on messages already seen.
 | `PORTCULLIS_ANTHROPIC_KEY` | for Claude Code | Anthropic key, sent as `x-api-key` (not a bearer token) |
 | `PORTCULLIS_ANTHROPIC_VERSION` | no | Default `2023-06-01`; a client-supplied version wins |
 
+## Transparent passthrough
+
+Sometimes you cannot, or do not want to, repoint a client: it has many providers,
+fallbacks or side models, each with its own URL, key and headers. With
+`PORTCULLIS_PASSTHROUGH=1` the client keeps all of that. Something in front of its
+HTTP layer (in hermes-suite, a small `httpx` hook) sends each request to Portcullis
+instead and names the real endpoint in one header:
+
+```
+POST http://127.0.0.1:8080/v1/chat/completions
+x-portcullis-upstream: https://opencode.ai/zen/go/v1/chat/completions
+authorization: Bearer <the client's own key>
+x-opencode-session: <whatever the client sends>
+```
+
+Portcullis redacts as usual, then forwards to that URL with the client's own headers
+(hop-by-hop headers and `x-portcullis-upstream` itself are dropped), and rehydrates the
+reply. `/v1/messages` works the same way, forwarding the client's `x-api-key`.
+`PORTCULLIS_UPSTREAM_URL` becomes optional: requests without the header still use it,
+and get a 400 if it is unset.
+
+| Variable | Purpose |
+|---|---|
+| `PORTCULLIS_PASSTHROUGH` | `1`/`true` enables the mode. Off: the header is rejected with 400, never ignored |
+| `PORTCULLIS_PASSTHROUGH_HOSTS` | optional comma-separated allowlist; an entry matches the host and its subdomains (403 otherwise) |
+
+Guard rails: passthrough refuses to start on a non-loopback bind without
+`PORTCULLIS_PASSTHROUGH_HOSTS` (it would be an open proxy), and cannot be combined with
+scope tokens (the forwarded `Authorization` header is where a scope token lives).
+
 ## What Portcullis does *not* do
 
 - It is **not** a network service you expose. Bind it to `127.0.0.1` — it holds your
