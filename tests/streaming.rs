@@ -471,3 +471,45 @@ async fn streaming_request_handles_placeholder_split_across_events() {
         text
     );
 }
+
+/// A multi-byte character split across network chunks, and CRLF-terminated events,
+/// must reach the client intact.
+#[tokio::test]
+async fn streaming_request_preserves_split_multibyte_and_crlf_events() {
+    let gw = Gateway::new(Store::default());
+
+    let event = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"héllo 日本 😀\"},\"finish_reason\":null}]}\r\n\r\n";
+    let bytes = event.as_bytes();
+    // Cut inside the 4-byte emoji.
+    let cut = event.find('😀').unwrap() + 2;
+    let upstream = MockUpstream {
+        bodies: Arc::new(Mutex::new(Vec::new())),
+        chunks: vec![
+            Bytes::copy_from_slice(&bytes[..cut]),
+            Bytes::copy_from_slice(&bytes[cut..]),
+            Bytes::from("data: [DONE]\r\n\r\n"),
+        ],
+    };
+    let upstream_url = spawn_server(mock_sse_app(upstream)).await;
+    let client = Client::new();
+    let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
+    let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
+
+    let text = client
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(text.contains("héllo 日本 😀"), "text was corrupted: {text}");
+    assert!(!text.contains('\u{FFFD}'), "replacement char in: {text}");
+    assert!(text.contains("[DONE]"), "{text}");
+}

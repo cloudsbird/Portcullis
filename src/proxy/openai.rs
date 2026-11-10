@@ -260,15 +260,18 @@ pub(super) async fn stream_response(
         Box::pin(upstream_resp.bytes_stream());
 
     let stream = futures::stream::try_unfold(
-        (String::new(), StreamCarry::default(), bytes_stream, vault),
+        (
+            SseBuffer::default(),
+            StreamCarry::default(),
+            bytes_stream,
+            vault,
+        ),
         |(mut buf, mut carry, mut stream, vault)| async move {
             loop {
                 // Emit a complete SSE event as soon as we have the blank-line
                 // delimiter. `carry` additionally holds back a partial
                 // placeholder that spans two events.
-                if let Some(event_end) = buf.find("\n\n") {
-                    let after = buf.split_off(event_end + 2);
-                    let event = std::mem::replace(&mut buf, after);
+                if let Some(event) = buf.next_event() {
                     let processed = process_sse_event(&event, &mut carry, &vault);
                     return Ok::<_, std::io::Error>(Some((
                         Bytes::from(processed),
@@ -278,15 +281,12 @@ pub(super) async fn stream_response(
 
                 match stream.try_next().await {
                     Ok(Some(chunk)) => {
-                        buf.push_str(&String::from_utf8_lossy(&chunk));
+                        buf.push(&chunk);
                     }
                     Ok(None) => {
-                        let mut tail = if buf.is_empty() {
-                            String::new()
-                        } else {
-                            let processed = process_sse_event(&buf, &mut carry, &vault);
-                            buf.clear();
-                            processed
+                        let mut tail = match buf.take_rest() {
+                            Some(rest) => process_sse_event(&rest, &mut carry, &vault),
+                            None => String::new(),
                         };
                         tail.push_str(&flush_carry(&mut carry, &vault));
                         if tail.is_empty() {
