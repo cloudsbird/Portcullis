@@ -46,5 +46,9 @@ originals**, so the cache itself is not a plaintext corpus.
    or ML detectors over the assembled body: JSON is full of numbers (timestamps, token
    counts) that look like phone numbers, so it would reject ordinary requests. A value
    that only a detector could have caught, and missed, is not stopped here.
+   An ML detector **failure** (as opposed to a miss) is fail-open by default: the
+   segment keeps dictionary and regex coverage, the failure is counted in
+   `portcullis_detector_errors_total`, and the scan is not cached so the next turn
+   retries it. `PORTCULLIS_DETECTOR_FAIL_CLOSED=1` blocks the request instead.
 5. **Prompt-cache sabotage** — redaction is a pure, stable function of the text, and
    unchanged history is redacted and numbered identically on every turn.

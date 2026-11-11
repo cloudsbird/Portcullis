@@ -96,7 +96,7 @@ scanner cannot mint series.
 | `portcullis_http_request_duration_seconds` | histogram | `route` | latency to response headers (a stream's body time is not included) |
 | `portcullis_redactions_total` | counter | `label` | how much is being hidden, by kind |
 | `portcullis_delta_cache_total` | counter | `result` | delta-cache hit rate |
-| `portcullis_blocked_total` | counter | `reason` | `residual_term` / `malformed_placeholder` (fail-closed), `unauthorized_scope`, `unauthorized_admin` |
+| `portcullis_blocked_total` | counter | `reason` | `residual_term` / `malformed_placeholder` (fail-closed), `detector_error` (with `PORTCULLIS_DETECTOR_FAIL_CLOSED`), `unauthorized_scope`, `unauthorized_admin` |
 | `portcullis_scan_duration_seconds` | histogram | — | detection cost per request |
 | `portcullis_gateway_lock_wait_seconds` | histogram | — | **queueing** behind the single gateway lock; rising means detection is your bottleneck |
 | `portcullis_upstream_responses_total` | counter | `outcome` | provider status codes, `timeout`, `error` |
@@ -136,6 +136,23 @@ each turn is scanned — so steady-state chat traffic is materially faster than 
 worst case. But if you need genuine parallel detection, that is a scheduling change (a
 pool of detector instances), not a config knob, and it is not implemented today.
 
+## Memory
+
+The model's resident footprint is roughly flat (~0.7 GB for GLiNER2-PII). What varies is
+**inference** memory: the encoder's attention is quadratic in input length, so a single call
+over one long segment can need several gigabytes (measured: 2.5 GB at 10 KB, OOM-killed at
+30 KB). The gateway therefore never hands the detector a whole segment. It cuts each
+segment into windows of at most `ML_WINDOW_BYTES` (1,536 bytes), with 256 bytes of overlap
+so an entity on a cut is still seen whole by the next window, and runs them one after another.
+Peak memory is that of one window whatever the payload size; scan time grows linearly with it.
+
+The window is measured in **bytes, not tokens**. Byte-dense text (CJK, punctuation-heavy
+JSON) produces more tokens per byte, so its windows cost more; the default leaves headroom
+for that. The dictionary and regex layers are linear and scan the whole segment unwindowed.
+
+ONNX Runtime keeps its arena at the largest allocation it has made, so judge memory by
+peak RSS across a run of large requests, not by a single one.
+
 ## Running it
 
 ```bash
@@ -170,6 +187,7 @@ it an open redaction proxy for your provider key.
 | `PORTCULLIS_MODEL_DIR` | `./model` | detector dir when not using a named model |
 | `PORTCULLIS_LABELS` | detector default | comma-separated label set |
 | `PORTCULLIS_THRESHOLD` | `0.5` | detector confidence cut-off |
+| `PORTCULLIS_DETECTOR_FAIL_CLOSED` | off | `1`/`true`: a request whose ML scan fails is blocked with 503 (`portcullis_blocked_total{reason="detector_error"}`). Off: it is sent with dictionary + regex coverage. Either way the failed scan is not cached |
 | `PORTCULLIS_MAX_BODY_BYTES` | `2097152` | request body cap |
 | `PORTCULLIS_FORWARD_HEADERS` | — | comma-separated **client** headers to pass upstream (opt-in allowlist) |
 | `PORTCULLIS_UPSTREAM_HEADERS` | — | JSON object of static headers added to every upstream request |

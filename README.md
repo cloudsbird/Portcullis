@@ -221,8 +221,11 @@ Four invariants are enforced as tests in
    system prompt carries injected memory, so it holds PII too.
 3. **Invalidate on policy change.** `teach` and `unteach` clear the delta cache. A
    redaction cached before a term was taught would otherwise leak that term forever.
-4. **Fail closed.** The assembled payload is asserted clean before it leaves. If any
-   detector errors, the prompt is not sent.
+4. **Fail closed.** The assembled payload is asserted clean of taught terms and
+   malformed placeholders before it leaves; if not, the prompt is not sent. If the ML
+   detector errors, the segment is still covered by the dictionary and regex layers and
+   is not cached, so it is rescanned next turn. Set `PORTCULLIS_DETECTOR_FAIL_CLOSED=1`
+   to block the request instead (503).
 
 Detection runs in three layers, merged with a fixed priority (dictionary → regex → model),
 so the ML layer can only *add* recall and can never override a deterministic match.
@@ -251,6 +254,7 @@ Everything is environment variables. The ones that matter most:
 | `PORTCULLIS_MODEL` | — | named detector from the registry |
 | `PORTCULLIS_MODEL_DIR` | `./model` | detector directory |
 | `PORTCULLIS_THRESHOLD` | `0.5` | detector confidence cut-off |
+| `PORTCULLIS_DETECTOR_FAIL_CLOSED` | off | block a request (503) if the ML detector fails, instead of sending it with dictionary + regex coverage |
 | `PORTCULLIS_LOG_FORMAT` | text | `json` for structured logs |
 | `PORTCULLIS_METRICS_TOKEN` | — | require a bearer token on `/metrics` (default: open) |
 

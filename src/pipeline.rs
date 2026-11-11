@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-use crate::detect::{merge, Detector, DictionaryDetector, RegexDetector};
+use crate::detect::{detect_windowed, merge, Detector, DictionaryDetector, RegexDetector};
 use crate::metrics::Metrics;
 use crate::store::Store;
 use crate::vault::Vault;
@@ -52,6 +52,26 @@ struct CachedSpan {
     label: String,
 }
 
+/// Why a scan refused to produce an outbound payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanError {
+    /// The ML detector failed on a segment and the gateway is configured to fail
+    /// closed (see [`Gateway::with_fail_closed`]).
+    DetectorFailed,
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScanError::DetectorFailed => {
+                f.write_str("detector failed; request blocked (fail-closed)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScanError {}
+
 /// Maximum number of recent auto-suggest candidates to retain.
 const SUGGESTION_LIMIT: usize = 200;
 
@@ -71,6 +91,9 @@ pub struct Gateway {
     /// Compiled dictionaries by scope, each tagged with the fingerprint of the deny-list
     /// it was built from.
     dicts: Mutex<DictCache>,
+    /// Block a scan when the ML detector fails, instead of forwarding with dictionary
+    /// and regex coverage only.
+    fail_closed: bool,
 }
 
 impl Gateway {
@@ -86,7 +109,23 @@ impl Gateway {
             suggestions: VecDeque::new(),
             metrics,
             dicts: Mutex::new(HashMap::new()),
+            fail_closed: false,
         }
+    }
+
+    /// Choose what happens when the ML detector fails on a segment.
+    ///
+    /// Either way the failed scan is **not cached**, so the segment is scanned again
+    /// on the next turn rather than losing ML coverage for the rest of the
+    /// conversation. With `fail_closed`, [`Gateway::try_process_scoped`] also returns
+    /// [`ScanError::DetectorFailed`] and nothing is sent.
+    pub fn with_fail_closed(mut self, fail_closed: bool) -> Self {
+        self.fail_closed = fail_closed;
+        self
+    }
+
+    pub fn fail_closed(&self) -> bool {
+        self.fail_closed
     }
 
     /// Attach an extra detector (e.g. `OnnxDetector`). Dictionary + regex still run
@@ -276,20 +315,31 @@ impl Gateway {
         scope: Option<&str>,
         dict: &DictionaryDetector,
         seg: &str,
-    ) -> Vec<CachedSpan> {
+    ) -> (Vec<CachedSpan>, bool) {
+        let mut failed = false;
         let mut spans = dict.detect(seg);
         spans.extend(self.regexes.detect(seg));
         if let Some(extra) = &self.extra {
             // A third-party detector's offsets are not trusted to land on character
             // boundaries: slicing mid-character would panic, and a misaligned span
             // would redact the wrong bytes. Widen to the enclosing boundaries.
-            spans.extend(extra.detect(seg).into_iter().filter_map(|mut s| {
-                (s.start, s.end) = snap_to_boundaries(seg, s.start, s.end)?;
-                Some(s)
-            }));
-            let failed = extra.take_failures();
-            if failed > 0 {
-                self.metrics.detector_errors(failed);
+            //
+            // The segment goes to the detector in bounded windows, never whole: encoder
+            // memory is quadratic in input length, so one long tool output would
+            // otherwise take the process down.
+            spans.extend(
+                detect_windowed(extra.as_ref(), seg)
+                    .into_iter()
+                    .filter_map(|mut s| {
+                        (s.start, s.end) = snap_to_boundaries(seg, s.start, s.end)?;
+                        Some(s)
+                    }),
+            );
+            // Any failed window fails the segment. The metric counts segments, not
+            // windows, so its meaning does not depend on how long the text was.
+            if extra.take_failures() > 0 {
+                self.metrics.detector_errors(1);
+                failed = true;
             }
         }
         let mut kept = Vec::new();
@@ -307,7 +357,7 @@ impl Gateway {
                 label: s.label,
             });
         }
-        kept
+        (kept, failed)
     }
 
     /// Replace each span with its placeholder from `vault`.
@@ -346,6 +396,30 @@ impl Gateway {
         vault: &mut Vault,
         segments: &[String],
     ) -> Vec<String> {
+        self.scan(scope, vault, segments, false)
+            .expect("a fail-open scan cannot fail")
+    }
+
+    /// [`Gateway::process_scoped`], honouring [`Gateway::with_fail_closed`]: if the ML
+    /// detector fails on any segment and the gateway fails closed, nothing is
+    /// returned. This is what the proxy uses.
+    pub fn try_process_scoped(
+        &mut self,
+        scope: Option<&str>,
+        vault: &mut Vault,
+        segments: &[String],
+    ) -> Result<Vec<String>, ScanError> {
+        let fail_closed = self.fail_closed;
+        self.scan(scope, vault, segments, fail_closed)
+    }
+
+    fn scan(
+        &mut self,
+        scope: Option<&str>,
+        vault: &mut Vault,
+        segments: &[String],
+        fail_closed: bool,
+    ) -> Result<Vec<String>, ScanError> {
         if self.cache.len() >= CACHE_LIMIT {
             self.cache.clear();
         }
@@ -363,8 +437,17 @@ impl Gateway {
                 None => {
                     misses += 1;
                     let dict = dict.get_or_insert_with(|| self.dictionary(scope)).clone();
-                    let spans = self.detect_spans(scope, &dict, seg);
-                    self.cache.insert(h, spans.clone());
+                    let (spans, failed) = self.detect_spans(scope, &dict, seg);
+                    if failed {
+                        // Not cached: a cached partial scan would deny this segment
+                        // ML coverage on every later turn.
+                        if fail_closed {
+                            self.metrics.cache(hits, misses);
+                            return Err(ScanError::DetectorFailed);
+                        }
+                    } else {
+                        self.cache.insert(h, spans.clone());
+                    }
                     spans
                 }
             };
@@ -375,7 +458,7 @@ impl Gateway {
         }
         self.metrics.cache(hits, misses);
         self.metrics.set_store_terms(self.store.deny.len());
-        out
+        Ok(out)
     }
 
     /// [`Gateway::process_with`] against the gateway's own vault. Meant for the
@@ -447,6 +530,107 @@ mod tests {
                 score: 0.9,
             }]
         }
+    }
+
+    /// Fails on every call, counting each failure like the ONNX detector does.
+    #[derive(Default)]
+    struct Failing {
+        calls: std::sync::atomic::AtomicU64,
+        pending: std::sync::atomic::AtomicU64,
+    }
+    impl Detector for Failing {
+        fn detect(&self, _text: &str) -> Vec<crate::detect::Span> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.pending.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        }
+        fn take_failures(&self) -> u64 {
+            self.pending.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Shares the call counter with the test after the detector is boxed.
+    struct Shared(Arc<Failing>);
+    impl Detector for Shared {
+        fn detect(&self, text: &str) -> Vec<crate::detect::Span> {
+            self.0.detect(text)
+        }
+        fn take_failures(&self) -> u64 {
+            self.0.take_failures()
+        }
+    }
+
+    #[test]
+    fn a_failed_scan_is_not_cached_so_the_next_turn_rescans() {
+        let failing = Arc::new(Failing::default());
+        let mut gw =
+            Gateway::new(Store::default()).with_detector(Box::new(Shared(failing.clone())));
+        let seg = vec!["mail a@b.co".to_string()];
+        let first = gw.process(&seg);
+        let second = gw.process(&seg);
+        assert_eq!(first, second, "fail-open still redacts deterministically");
+        assert!(first[0].contains("<<EMAIL_1>>"), "{first:?}");
+        assert_eq!(
+            failing.calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a failed scan must be retried, not served from the cache"
+        );
+    }
+
+    #[test]
+    fn fail_open_forwards_and_fail_closed_blocks() {
+        let seg = vec!["hello".to_string()];
+
+        let mut open = Gateway::new(Store::default()).with_detector(Box::new(Failing::default()));
+        let mut vault = Vault::new();
+        assert!(open.try_process_scoped(None, &mut vault, &seg).is_ok());
+
+        let mut closed = Gateway::new(Store::default())
+            .with_detector(Box::new(Failing::default()))
+            .with_fail_closed(true);
+        let mut vault = Vault::new();
+        assert_eq!(
+            closed.try_process_scoped(None, &mut vault, &seg),
+            Err(ScanError::DetectorFailed)
+        );
+    }
+
+    /// Records the longest text it was asked to scan.
+    struct Longest(Arc<std::sync::atomic::AtomicUsize>);
+    impl Detector for Longest {
+        fn detect(&self, text: &str) -> Vec<crate::detect::Span> {
+            self.0
+                .fetch_max(text.len(), std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_long_segment_reaches_the_detector_in_bounded_windows() {
+        let longest = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut gw =
+            Gateway::new(Store::default()).with_detector(Box::new(Longest(longest.clone())));
+        let seg = "lorem ipsum dolor sit amet ".repeat(8000); // ~216 KB
+        gw.process(&[seg]);
+        let n = longest.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            n > 0 && n <= crate::detect::ML_WINDOW_BYTES,
+            "longest call {n} bytes"
+        );
+    }
+
+    #[test]
+    fn a_failing_long_segment_counts_one_detector_error() {
+        let mut gw = Gateway::new(Store::default()).with_detector(Box::new(Failing::default()));
+        gw.process(&["word ".repeat(10_000)]);
+        assert!(
+            gw.metrics
+                .render()
+                .contains("portcullis_detector_errors_total 1"),
+            "{}",
+            gw.metrics.render()
+        );
     }
 
     #[test]

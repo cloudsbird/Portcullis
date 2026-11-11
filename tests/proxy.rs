@@ -365,3 +365,59 @@ async fn placeholders_do_not_leak_across_requests() {
         "client B received client A's values: {b}"
     );
 }
+
+/// An ML detector that fails on every segment, like a broken ONNX model.
+#[derive(Default)]
+struct FailingDetector {
+    pending: std::sync::atomic::AtomicU64,
+}
+
+impl portcullis::detect::Detector for FailingDetector {
+    fn detect(&self, _text: &str) -> Vec<portcullis::detect::Span> {
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Vec::new()
+    }
+    fn take_failures(&self) -> u64 {
+        self.pending.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// With fail-closed on, a detector failure blocks the request: 503, nothing upstream.
+/// With it off (the default), the request is forwarded on deterministic coverage.
+#[tokio::test]
+async fn detector_failure_blocks_only_when_fail_closed() {
+    for fail_closed in [true, false] {
+        let gw = Gateway::new(Store::default())
+            .with_detector(Box::new(FailingDetector::default()))
+            .with_fail_closed(fail_closed);
+
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let upstream_url = spawn_server(mock_app(MockUpstream {
+            bodies: bodies.clone(),
+        }))
+        .await;
+        let client = Client::new();
+        let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
+        let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
+
+        let resp = client
+            .post(&proxy_url)
+            .json(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        let forwarded = bodies.lock().await.len();
+        if fail_closed {
+            assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(forwarded, 0, "a blocked request must not reach upstream");
+        } else {
+            assert!(resp.status().is_success(), "{:?}", resp.status());
+            assert_eq!(forwarded, 1);
+        }
+    }
+}

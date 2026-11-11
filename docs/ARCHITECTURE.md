@@ -74,7 +74,7 @@ sequenceDiagram
 | 1. Never echo a raw segment | `Gateway::process` — a cache hit re-emits the cached **redacted** form, never the input |
 | 2. No bypass | `handle()` walks *every* text-bearing field of *every* message, including the system prompt |
 | 3. Invalidate on policy change | `Gateway::teach` / `unteach` call `cache.clear()` |
-| 4. Fail closed | `assert_clean(entire serialized payload)` runs **before** the upstream call; any error is a 502 |
+| 4. Fail closed | `assert_clean(entire serialized payload)` runs **before** the upstream call; any error is a 502. An ML detector failure is a 503 only with `PORTCULLIS_DETECTOR_FAIL_CLOSED` |
 
 ## The redaction pipeline, in detail
 
@@ -96,6 +96,12 @@ flowchart LR
 **Merge priority matters.** On overlapping spans the deterministic layers win: dictionary
 (0) → regex (1) → model (2). The ML detector can therefore only ever *add* recall — it can
 never override or weaken the guarantee.
+
+**The model sees bounded windows, not whole segments.** Encoder memory is quadratic in input
+length, so `detect_windowed` feeds `OnnxDetector` overlapping windows of at most 1,536 bytes,
+cut on whitespace, and shifts the spans back to segment offsets before `merge()`. If any
+window fails, the whole segment counts as failed (not cached; blocked when fail-closed).
+See [OPERATIONS.md § Memory](OPERATIONS.md#memory).
 
 The **allow-list** is consulted last: a value on it is emitted as-is even if a detector
 flagged it, and it is skipped by `assert_clean`.

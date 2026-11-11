@@ -298,7 +298,7 @@ impl Metrics {
 
         let _ = writeln!(
             o,
-            "# HELP portcullis_detector_errors_total Segments where the ML detector failed and only dictionary and regex coverage applied."
+            "# HELP portcullis_detector_errors_total Segments where the ML detector failed (forwarded on dictionary and regex coverage, or blocked when fail-closed)."
         );
         let _ = writeln!(o, "# TYPE portcullis_detector_errors_total counter");
         let _ = writeln!(

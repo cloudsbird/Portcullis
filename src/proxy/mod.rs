@@ -156,6 +156,18 @@ fn parse_extra_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
 }
 
 /// Parse a positive integer number of seconds from the environment.
+/// `1`, `true`, `yes` or `on` (any case) → true; anything else, or unset → false.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn env_secs(key: &str, default: u64) -> Duration {
     Duration::from_secs(
         std::env::var(key)
@@ -318,6 +330,10 @@ pub fn app(state: ProxyState) -> Router {
 /// https://api.anthropic.com/v1/messages), `PORTCULLIS_ANTHROPIC_KEY`, and
 /// `PORTCULLIS_ANTHROPIC_VERSION` (default 2023-06-01).
 pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
+    let gateway = gateway.with_fail_closed(env_flag("PORTCULLIS_DETECTOR_FAIL_CLOSED"));
+    if gateway.fail_closed() {
+        tracing::info!("detector fail-closed: a request is blocked if the ML detector fails");
+    }
     let upstream_url = std::env::var("PORTCULLIS_UPSTREAM_URL")
         .map_err(|_| anyhow::anyhow!("PORTCULLIS_UPSTREAM_URL is not set"))?;
     // Accept a base URL or a full endpoint — see normalize_chat_url.
