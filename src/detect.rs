@@ -258,6 +258,103 @@ impl Detector for RegexDetector {
     }
 }
 
+/// Longest text, in bytes, handed to an ML detector in one call.
+///
+/// A transformer encoder's memory grows with the square of its input length, so
+/// one call over a long segment (a big tool output, a pasted file) can need gigabytes:
+/// measured peaks were 0.8 GB at 2 KB, 2.5 GB at 10 KB and an OOM kill at 30 KB.
+/// Windowing keeps every call near the model's idle footprint, whatever the segment
+/// length. This counts bytes, not tokens; byte-dense text (CJK, punctuation-heavy
+/// JSON) yields more tokens per byte, which is why it sits below the measured 2 KB.
+pub const ML_WINDOW_BYTES: usize = 1536;
+
+/// Bytes shared by neighbouring windows, so an entity cut by one window's edge is
+/// seen whole by the next. PII spans are short; this is far longer than any of them.
+pub const ML_WINDOW_OVERLAP: usize = 256;
+
+/// Largest char boundary at or below `i`.
+fn floor_boundary(text: &str, mut i: usize) -> usize {
+    i = i.min(text.len());
+    while !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Split `text` into byte ranges of at most `window` bytes, each starting where the
+/// previous one's last `overlap` bytes begin. Cuts land on whitespace where there is
+/// any in reach, so words are not split; otherwise on a char boundary. Every range is
+/// a valid slice of `text`, and together they cover all of it.
+pub fn windows(text: &str, window: usize, overlap: usize) -> Vec<(usize, usize)> {
+    // A window of a few bytes cannot hold even one 4-byte character, and an overlap
+    // of half the window or more would stop the loop from making progress.
+    let window = window.max(16);
+    let overlap = overlap.min(window / 2 - 1);
+    let len = text.len();
+    let mut out = Vec::new();
+    let mut start = 0;
+    while len - start > window {
+        let hard_end = floor_boundary(text, start + window);
+        // Prefer to end just after whitespace in the window's back half.
+        let back = floor_boundary(text, start + window / 2);
+        let end = match text[back..hard_end].rfind(char::is_whitespace) {
+            Some(i) => {
+                let ws = back + i;
+                ws + text[ws..].chars().next().map_or(1, char::len_utf8)
+            }
+            None => hard_end,
+        };
+        out.push((start, end));
+        // Step back by `overlap`, then forward to the next word start inside it.
+        let lap = floor_boundary(text, end.saturating_sub(overlap));
+        let next = match text[lap..end].find(char::is_whitespace) {
+            Some(i) => {
+                let ws = lap + i;
+                ws + text[ws..].chars().next().map_or(1, char::len_utf8)
+            }
+            None => lap,
+        };
+        // `end` lies past the window's midpoint and `overlap < window/2`, so `next`
+        // is ahead of `start` at any sane size; falling back to `end` guarantees
+        // progress even for a degenerate one.
+        start = if next > start { next } else { end };
+    }
+    out.push((start, len));
+    out
+}
+
+/// Run `detector` over `text` window by window (see [`windows`]) and return spans in
+/// `text`'s coordinates. Windows run one after another, never batched, so peak memory
+/// is that of a single window. Overlapping windows can report the same entity twice;
+/// [`merge`] keeps one. Offsets are clamped to their window but not snapped to char
+/// boundaries — callers that slice must do that.
+pub fn detect_windowed(detector: &dyn Detector, text: &str) -> Vec<Span> {
+    detect_windowed_with(detector, text, ML_WINDOW_BYTES, ML_WINDOW_OVERLAP)
+}
+
+pub fn detect_windowed_with(
+    detector: &dyn Detector,
+    text: &str,
+    window: usize,
+    overlap: usize,
+) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for (a, b) in windows(text, window, overlap) {
+        let w = b - a;
+        spans.extend(
+            detector
+                .detect(&text[a..b])
+                .into_iter()
+                .filter_map(|mut s| {
+                    s.start = s.start.min(w) + a;
+                    s.end = s.end.min(w) + a;
+                    (s.start < s.end).then_some(s)
+                }),
+        );
+    }
+    spans
+}
+
 /// Source priority: the deterministic layers win over the ML detector on overlap.
 fn source_priority(source: &str) -> u8 {
     match source {
@@ -292,6 +389,96 @@ pub fn merge(mut spans: Vec<Span>) -> Vec<Span> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every range is a valid slice, within the window, and the ranges cover `text`
+    /// end to end with each one overlapping or touching the previous.
+    fn check_windows(text: &str, window: usize, overlap: usize) -> Vec<(usize, usize)> {
+        let ws = windows(text, window, overlap);
+        assert_eq!(ws.first().unwrap().0, 0);
+        assert_eq!(ws.last().unwrap().1, text.len());
+        for (i, &(a, b)) in ws.iter().enumerate() {
+            assert!(text.is_char_boundary(a) && text.is_char_boundary(b));
+            assert!(a < b || text.is_empty(), "empty window {a}..{b}");
+            assert!(b - a <= window.max(16), "window {a}..{b} over {window}");
+            if i > 0 {
+                let (pa, pb) = ws[i - 1];
+                assert!(a > pa, "no progress: {pa}..{pb} then {a}..{b}");
+                assert!(a <= pb, "gap between {pa}..{pb} and {a}..{b}");
+            }
+        }
+        ws
+    }
+
+    #[test]
+    fn short_text_is_one_window() {
+        assert_eq!(windows("", 64, 8), vec![(0, 0)]);
+        let exact = "a".repeat(64);
+        assert_eq!(windows(&exact, 64, 8), vec![(0, 64)]);
+        let over = "a".repeat(65);
+        assert_eq!(check_windows(&over, 64, 8).len(), 2);
+    }
+
+    #[test]
+    fn windows_cut_on_whitespace_when_they_can() {
+        let text = "word ".repeat(200);
+        for (a, b) in check_windows(&text, 64, 16) {
+            assert!(a == 0 || text[..a].ends_with(' '), "starts mid-word at {a}");
+            assert!(
+                b == text.len() || text[..b].ends_with(' '),
+                "ends mid-word at {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_without_whitespace_or_with_multibyte_text_stay_valid() {
+        check_windows(&"x".repeat(5000), 64, 16);
+        check_windows(&"{\"k\":\"v\"},".repeat(500), 64, 16);
+        check_windows(&"é€😀字".repeat(400), 64, 16);
+        check_windows(&"😀".repeat(400), 17, 8);
+        // Degenerate settings are clamped rather than looping or panicking.
+        check_windows(&"é€😀 字".repeat(100), 0, 1000);
+        check_windows(&"é€😀 字".repeat(100), 16, 16);
+    }
+
+    /// Finds "Alice Smith" only when it sees the whole name, and records the longest
+    /// text it was given.
+    #[derive(Default)]
+    struct FullName {
+        longest: std::sync::atomic::AtomicUsize,
+    }
+    impl Detector for FullName {
+        fn detect(&self, text: &str) -> Vec<Span> {
+            self.longest
+                .fetch_max(text.len(), std::sync::atomic::Ordering::Relaxed);
+            text.match_indices("Alice Smith")
+                .map(|(i, m)| Span {
+                    start: i,
+                    end: i + m.len(),
+                    label: "PERSON".into(),
+                    source: "onnx",
+                    score: 0.9,
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn windowed_detection_is_bounded_and_finds_entities_on_every_cut() {
+        let det = FullName::default();
+        // Shift the name across every offset relative to the window edges.
+        for pad in 0..80 {
+            let text = format!(
+                "{}Alice Smith {}",
+                "filler ".repeat(pad),
+                "tail ".repeat(40)
+            );
+            let spans = merge(detect_windowed_with(&det, &text, 64, 24));
+            let found: Vec<&str> = spans.iter().map(|s| &text[s.start..s.end]).collect();
+            assert_eq!(found, vec!["Alice Smith"], "pad {pad}");
+        }
+        assert!(det.longest.load(std::sync::atomic::Ordering::Relaxed) <= 64);
+    }
 
     fn labels(text: &str) -> Vec<(String, String)> {
         merge(RegexDetector::new().detect(text))

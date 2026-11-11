@@ -242,6 +242,18 @@ fn host_allowed(host: &str, allow: &[String]) -> bool {
             .any(|a| host == a || host.ends_with(&format!(".{a}")))
 }
 
+/// `1`, `true`, `yes` or `on` (any case) → true; anything else, or unset → false.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Parse a positive integer number of seconds from the environment.
 fn env_secs(key: &str, default: u64) -> Duration {
     Duration::from_secs(
@@ -417,14 +429,11 @@ pub fn app(state: ProxyState) -> Router {
 /// https://api.anthropic.com/v1/messages), `PORTCULLIS_ANTHROPIC_KEY`, and
 /// `PORTCULLIS_ANTHROPIC_VERSION` (default 2023-06-01).
 pub async fn serve(gateway: Gateway, bind: &str) -> anyhow::Result<()> {
-    let passthrough = matches!(
-        std::env::var("PORTCULLIS_PASSTHROUGH")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    );
+    let gateway = gateway.with_fail_closed(env_flag("PORTCULLIS_DETECTOR_FAIL_CLOSED"));
+    if gateway.fail_closed() {
+        tracing::info!("detector fail-closed: a request is blocked if the ML detector fails");
+    }
+    let passthrough = env_flag("PORTCULLIS_PASSTHROUGH");
     let passthrough_hosts: Vec<String> = std::env::var("PORTCULLIS_PASSTHROUGH_HOSTS")
         .map(|raw| {
             raw.split(',')

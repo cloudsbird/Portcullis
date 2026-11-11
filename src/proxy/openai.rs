@@ -172,7 +172,7 @@ pub(super) async fn handle(
             let lock_wait = waited.elapsed().as_secs_f64();
             let scanning = Instant::now();
             let mut vault = Vault::new();
-            let out = gw.process_scoped(scope.as_deref(), &mut vault, &texts);
+            let out = gw.try_process_scoped(scope.as_deref(), &mut vault, &texts);
             gw.metrics()
                 .scan(lock_wait, scanning.elapsed().as_secs_f64());
             (out, vault)
@@ -185,6 +185,11 @@ pub(super) async fn handle(
             )
         })?
     };
+    // Fail closed: the ML detector failed and the gateway is configured to block.
+    let redacted_texts = redacted_texts.map_err(|e| {
+        state.metrics.blocked("detector_error");
+        (StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+    })?;
 
     // Place redacted strings back into the message copies.
     {

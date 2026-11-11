@@ -270,7 +270,7 @@ fn run_detect(
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
-    use portcullis::detect::Detector;
+    use portcullis::detect::detect_windowed;
     use portcullis::detect_onnx::OnnxDetector;
     use serde_json::json;
 
@@ -314,8 +314,22 @@ fn run_detect(
         };
         let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
         let text = value.get("text").and_then(|t| t.as_str()).unwrap_or("");
-        let entities: Vec<serde_json::Value> = detector
-            .detect(text)
+        // Windowed like the gateway, so a long line cannot exhaust memory. Windows
+        // overlap, so drop repeats with the detector's own rule (highest score wins
+        // among same-label overlaps); for a one-window text that is a no-op, so the
+        // benchmark output is unchanged.
+        let mut spans = detect_windowed(&detector, text);
+        spans.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let mut kept: Vec<portcullis::detect::Span> = Vec::new();
+        for s in spans {
+            if !kept
+                .iter()
+                .any(|k| k.label == s.label && s.start < k.end && s.end > k.start)
+            {
+                kept.push(s);
+            }
+        }
+        let entities: Vec<serde_json::Value> = kept
             .iter()
             .map(|s| {
                 json!({
