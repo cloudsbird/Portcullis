@@ -19,6 +19,9 @@ pub(super) struct StreamCarry {
     /// Reasoning/thinking keeps its own buffer. Two text fields interleave in one
     /// stream, so stitching a split placeholder across them would corrupt both.
     pub(super) reasoning: String,
+    /// OpenRouter's `reasoning` delta. Separate from `reasoning_content` because a
+    /// gateway may stream both side by side.
+    pub(super) reasoning_alt: String,
 }
 
 /// Split `combined` into (safe to emit, holds back a partial placeholder).

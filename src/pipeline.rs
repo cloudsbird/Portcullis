@@ -483,15 +483,21 @@ impl Gateway {
         scope: Option<&str>,
         segments: &[String],
     ) -> Result<(), String> {
-        let dict = self.dictionary(scope);
-        for seg in segments {
-            for span in dict.detect(seg) {
-                if !self.store.is_allowed_for(scope, &seg[span.start..span.end]) {
-                    return Err("residual protected term in outbound".into());
-                }
-            }
+        match self.first_residual_term(scope, segments) {
+            Some(_) => Err("residual protected term in outbound".into()),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    /// Index of the first segment that still contains a protected term, if any.
+    /// Lets a caller say *where* a block happened without echoing the term.
+    pub fn first_residual_term(&self, scope: Option<&str>, segments: &[String]) -> Option<usize> {
+        let dict = self.dictionary(scope);
+        segments.iter().position(|seg| {
+            dict.detect(seg)
+                .iter()
+                .any(|span| !self.store.is_allowed_for(scope, &seg[span.start..span.end]))
+        })
     }
 
     pub fn assert_clean_scoped(

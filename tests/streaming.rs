@@ -472,6 +472,51 @@ async fn streaming_request_handles_placeholder_split_across_events() {
     );
 }
 
+/// OpenRouter streams reasoning as `delta.reasoning`; placeholders in it are restored
+/// like content, including one split across events.
+#[tokio::test]
+async fn streaming_request_rehydrates_openrouter_reasoning() {
+    let mut store = Store::default();
+    store.teach("daniel@example.com", "EMAIL", "global");
+    let gw = Gateway::new(store);
+
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let upstream = MockUpstream {
+        bodies: bodies.clone(),
+        chunks: vec![
+            Bytes::from(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"Mail <<EMAI\"},\"finish_reason\":null}]}\n\n",
+            ),
+            Bytes::from(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"L_1>> now\"},\"finish_reason\":null}]}\n\n",
+            ),
+            Bytes::from("data: [DONE]\n\n"),
+        ],
+    };
+    let upstream_url = spawn_server(mock_sse_app(upstream)).await;
+    let client = Client::new();
+    let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
+    let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
+
+    let resp = client
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Email daniel@example.com"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let text = resp.text().await.unwrap();
+    assert!(
+        !text.contains("<<EMAI") && !text.contains("L_1>>"),
+        "{text}"
+    );
+    assert!(text.contains("daniel@example.com"), "{text}");
+}
+
 /// A multi-byte character split across network chunks, and CRLF-terminated events,
 /// must reach the client intact.
 #[tokio::test]

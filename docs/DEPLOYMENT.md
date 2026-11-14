@@ -345,7 +345,8 @@ implemented yet (per-client `scope` is — see [SCOPES.md](SCOPES.md)) — see [
 | **502** immediately | cannot reach the provider; retried once | check DNS/egress and `PORTCULLIS_CONNECT_TIMEOUT_SECS` |
 | **502** after a long wait | upstream exceeded `PORTCULLIS_REQUEST_TIMEOUT_SECS` | raise it, or check provider status |
 | **413** | request body over 2 MiB | raise `PORTCULLIS_MAX_BODY_BYTES` |
-| client sees a literal `<<ORG_1>>` | the model echoed a placeholder in a field we don't rehydrate (we already fixed `content`, `reasoning_content` and tool-call arguments) | open an issue with the provider's response shape |
+| client sees a literal `<<ORG_1>>` | the model echoed a placeholder in a field we don't rehydrate (we already fixed `content`, `reasoning_content`, `reasoning` and tool-call arguments) | open an issue with the provider's response shape |
+| **502** `residual protected term in outbound at <path>` | a taught term sits in a field Portcullis forwards unchanged (tool definitions, `name`, a signed `reasoning_details` entry); the request is blocked, not leaked | the path names the field. A signed entry (Claude/Gemini via OpenRouter) cannot be edited, so start a new conversation; otherwise open an issue with the path |
 | `detector disabled` at startup | model dir missing or incomplete | expected if you skip the model; otherwise check `gliner2_config.json` exists |
 | **503** from `/teach` | `PORTCULLIS_ADMIN_TOKEN` unset | set it — the admin surface never runs unauthenticated |
 | slow first request, fast afterwards | ONNX model cold load (~5 s) once | expected |

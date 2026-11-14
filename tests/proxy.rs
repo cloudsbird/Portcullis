@@ -251,6 +251,218 @@ async fn proxy_redacts_tool_call_arguments_and_preserves_tool_calls() {
     );
 }
 
+/// Reasoning replayed in history (`reasoning_content`, OpenRouter's `reasoning` and
+/// unsigned `reasoning_details`) is redacted like content. It used to be forwarded
+/// as-is, so the outbound assertion blocked every request in a conversation whose
+/// reasoning mentioned a taught term: HTTP 502 "residual protected term in outbound".
+#[tokio::test]
+async fn proxy_redacts_replayed_reasoning_fields() {
+    let mut store = Store::default();
+    store.teach("Cartalian", "ORG", "global");
+    let gw = Gateway::new(store);
+
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let upstream_url = spawn_server(mock_app(MockUpstream {
+        bodies: bodies.clone(),
+    }))
+    .await;
+    let client = Client::new();
+    let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
+    let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
+
+    let signed = json!({
+        "type": "reasoning.text",
+        "text": "signed thoughts",
+        "signature": "sig-abc",
+        "format": "anthropic-claude-v1",
+        "index": 2
+    });
+    let resp = client
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Summarise the deal."},
+                {
+                    "role": "assistant",
+                    "content": "Looking it up.",
+                    "reasoning_content": "rc: Cartalian wants a summary",
+                    "reasoning": "r: Cartalian wants a summary",
+                    "reasoning_details": [
+                        {"type": "reasoning.text", "text": "dt: Cartalian", "signature": null, "index": 0},
+                        {"type": "reasoning.summary", "summary": "ds: Cartalian", "index": 1},
+                        signed,
+                        {"type": "reasoning.encrypted", "data": "opaque", "index": 3}
+                    ],
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"q\": \"Cartalian\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        resp.status().is_success(),
+        "proxy returned error: {:?}",
+        resp.text().await
+    );
+
+    let recorded = bodies.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert!(
+        !recorded[0].contains("Cartalian"),
+        "upstream body contained raw PII: {}",
+        recorded[0]
+    );
+    let forwarded: Value = serde_json::from_str(&recorded[0]).unwrap();
+    let msg = &forwarded["messages"][1];
+    // Each redacted string went back to the field it came from.
+    let field = |v: &Value| v.as_str().unwrap().to_string();
+    assert!(
+        field(&msg["reasoning_content"]).starts_with("rc: <<"),
+        "{msg}"
+    );
+    assert!(field(&msg["reasoning"]).starts_with("r: <<"), "{msg}");
+    assert!(
+        field(&msg["reasoning_details"][0]["text"]).starts_with("dt: <<"),
+        "{msg}"
+    );
+    assert!(
+        field(&msg["reasoning_details"][1]["summary"]).starts_with("ds: <<"),
+        "{msg}"
+    );
+    assert_eq!(field(&msg["content"]), "Looking it up.");
+    assert!(
+        field(&msg["tool_calls"][0]["function"]["arguments"]).contains("<<"),
+        "{msg}"
+    );
+    // Signed and encrypted entries are forwarded byte for byte.
+    assert_eq!(msg["reasoning_details"][2], signed);
+    assert_eq!(msg["reasoning_details"][3]["data"], "opaque");
+}
+
+/// A signed `reasoning_details` entry cannot be edited without the provider
+/// rejecting it, so one holding a taught term is blocked, and the error names the
+/// field (never the term).
+#[tokio::test]
+async fn signed_reasoning_with_a_taught_term_is_blocked_with_its_path() {
+    let mut store = Store::default();
+    store.teach("Cartalian", "ORG", "global");
+    let gw = Gateway::new(store);
+
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let upstream_url = spawn_server(mock_app(MockUpstream {
+        bodies: bodies.clone(),
+    }))
+    .await;
+    let client = Client::new();
+    let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
+    let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
+
+    let resp = client
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "assistant",
+                "content": "Done.",
+                "reasoning_details": [
+                    {"type": "reasoning.text", "text": "about Cartalian", "signature": "sig-abc"}
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let err = resp.text().await.unwrap();
+    assert_eq!(
+        err,
+        "residual protected term in outbound at messages[0].reasoning_details[0].text"
+    );
+    assert!(
+        bodies.lock().await.is_empty(),
+        "blocked request was forwarded"
+    );
+}
+
+async fn reasoning_echo_handler() -> Json<Value> {
+    Json(json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Noted.",
+                "reasoning_content": "thinking about <<ORG_1>>",
+                "reasoning": "thinking about <<ORG_1>>"
+            },
+            "finish_reason": "stop"
+        }]
+    }))
+}
+
+/// The loop that broke conversations: a reply's reasoning is rehydrated, the client
+/// replays it on the next turn, and that turn must still go through.
+#[tokio::test]
+async fn rehydrated_reasoning_can_be_replayed_next_turn() {
+    let mut store = Store::default();
+    store.teach("Cartalian", "ORG", "global");
+    let gw = Gateway::new(store);
+
+    let upstream_url =
+        spawn_server(Router::new().route("/v1/chat/completions", post(reasoning_echo_handler)))
+            .await;
+    let client = Client::new();
+    let state = ProxyState::new(gw, client.clone(), upstream_url, "key".into());
+    let proxy_url = spawn_server(portcullis::proxy::app(state)).await;
+
+    let first: Value = client
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Tell me about Cartalian."}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reply = first["choices"][0]["message"].clone();
+    assert_eq!(reply["reasoning_content"], "thinking about Cartalian");
+    assert_eq!(reply["reasoning"], "thinking about Cartalian");
+
+    let second = client
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Tell me about Cartalian."},
+                reply,
+                {"role": "user", "content": "And then?"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        second.status().is_success(),
+        "replayed reasoning was blocked: {:?}",
+        second.text().await
+    );
+}
+
 /// Multimodal `content` arrays have their text-bearing parts redacted while
 /// preserving the array shape and any non-text fields.
 #[tokio::test]
