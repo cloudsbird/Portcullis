@@ -690,23 +690,43 @@ pub(super) fn resolve_scope(
 /// characters (`"`, `\`, control characters, and optionally non-ASCII), so a taught
 /// term containing one would not appear verbatim there. Checking the decoded strings
 /// closes that gap.
-pub(super) fn outbound_strings(body: &Value) -> Vec<String> {
-    fn walk(v: &Value, out: &mut Vec<String>) {
+///
+/// Each string comes with its JSON path (`messages[2].reasoning_content`), for the
+/// block message. A key is listed before anything under it, so the first match is
+/// never reported through a path whose own keys hold a protected term.
+pub(super) fn outbound_strings(body: &Value) -> (Vec<String>, Vec<String>) {
+    fn walk(v: &Value, path: &str, strings: &mut Vec<String>, paths: &mut Vec<String>) {
         match v {
-            Value::String(s) => out.push(s.clone()),
-            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::String(s) => {
+                strings.push(s.clone());
+                paths.push(path.to_string());
+            }
+            Value::Array(a) => {
+                for (i, x) in a.iter().enumerate() {
+                    walk(x, &format!("{path}[{i}]"), strings, paths);
+                }
+            }
             Value::Object(m) => {
                 for (k, x) in m {
-                    out.push(k.clone());
-                    walk(x, out);
+                    strings.push(k.clone());
+                    paths.push(match path {
+                        "" => "a top-level key".to_string(),
+                        p => format!("a key in {p}"),
+                    });
+                    let child = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    walk(x, &child, strings, paths);
                 }
             }
             _ => {}
         }
     }
-    let mut out = Vec::new();
-    walk(body, &mut out);
-    out
+    let (mut strings, mut paths) = (Vec::new(), Vec::new());
+    walk(body, "", &mut strings, &mut paths);
+    (strings, paths)
 }
 
 /// The fail-closed outbound check (invariant 4), shared by both providers' handlers.
@@ -719,8 +739,17 @@ pub(super) fn assert_outbound_clean(
 ) -> Result<(), (StatusCode, String)> {
     let assembled =
         serde_json::to_string(body).map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    gw.assert_clean_scoped(scope, &[assembled])
-        .and_then(|()| gw.assert_no_terms_scoped(scope, &outbound_strings(body)))
+    // Decoded strings first, so a block names the field it came from.
+    let (strings, paths) = outbound_strings(body);
+    let decoded = match gw.first_residual_term(scope, &strings) {
+        Some(i) => Err(format!(
+            "residual protected term in outbound at {}",
+            paths[i]
+        )),
+        None => Ok(()),
+    };
+    decoded
+        .and_then(|()| gw.assert_clean_scoped(scope, &[assembled]))
         .map_err(|e| {
             metrics.blocked(if e.contains("residual") {
                 "residual_term"

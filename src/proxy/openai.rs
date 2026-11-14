@@ -18,6 +18,11 @@ pub(super) fn collect_message_texts(msg: &mut Value, out: &mut Vec<String>) {
         collect_tool_calls_texts(tool_calls, out);
     }
 
+    // Reasoning models get their earlier reasoning replayed in history (DeepSeek and
+    // Kimi reject a thinking-mode tool-call turn without it). Responses rehydrate
+    // reasoning, so on the next turn this text holds the real values.
+    collect_reasoning_texts(msg, out);
+
     // `name` and `tool_call_id` are protocol identifiers the provider matches on, so
     // they are forwarded unchanged rather than replaced with placeholders. They are
     // still covered by the fail-closed assertion over the whole outbound body: a
@@ -61,6 +66,72 @@ pub(super) fn collect_tool_calls_texts(tool_calls: &mut Value, out: &mut Vec<Str
     }
 }
 
+/// Top-level reasoning text fields on a message: `reasoning_content` (DeepSeek,
+/// Kimi, most OpenAI-compatible servers) and `reasoning` (OpenRouter).
+const REASONING_FIELDS: [&str; 2] = ["reasoning_content", "reasoning"];
+
+/// Text keys of an OpenRouter `reasoning_details` entry (`reasoning.text` and
+/// `reasoning.summary`).
+const REASONING_DETAIL_TEXT_KEYS: [&str; 2] = ["text", "summary"];
+
+/// A `reasoning_details` entry the provider verifies: it carries a signature or
+/// encrypted `data`. Editing its text makes the provider reject the turn, so it is
+/// forwarded unchanged and left to the fail-closed assertion.
+fn is_signed_reasoning_detail(map: &serde_json::Map<String, Value>) -> bool {
+    ["signature", "data"]
+        .iter()
+        .any(|k| matches!(map.get(*k), Some(Value::String(s)) if !s.is_empty()))
+}
+
+pub(super) fn collect_reasoning_texts(msg: &mut Value, out: &mut Vec<String>) {
+    for field in REASONING_FIELDS {
+        if let Some(Value::String(s)) = msg.get_mut(field) {
+            out.push(std::mem::take(s));
+        }
+    }
+    if let Some(Value::Array(details)) = msg.get_mut("reasoning_details") {
+        for detail in details {
+            let Value::Object(map) = detail else {
+                continue;
+            };
+            if is_signed_reasoning_detail(map) {
+                continue;
+            }
+            for key in REASONING_DETAIL_TEXT_KEYS {
+                if let Some(Value::String(s)) = map.get_mut(key) {
+                    out.push(std::mem::take(s));
+                }
+            }
+        }
+    }
+}
+
+/// Mirror of [`collect_reasoning_texts`]: same fields, same order, same checks.
+pub(super) fn replace_reasoning_texts(msg: &mut Value, redacted: &[String], idx: &mut usize) {
+    for field in REASONING_FIELDS {
+        if let Some(Value::String(s)) = msg.get_mut(field) {
+            *s = redacted[*idx].clone();
+            *idx += 1;
+        }
+    }
+    if let Some(Value::Array(details)) = msg.get_mut("reasoning_details") {
+        for detail in details {
+            let Value::Object(map) = detail else {
+                continue;
+            };
+            if is_signed_reasoning_detail(map) {
+                continue;
+            }
+            for key in REASONING_DETAIL_TEXT_KEYS {
+                if let Some(Value::String(s)) = map.get_mut(key) {
+                    *s = redacted[*idx].clone();
+                    *idx += 1;
+                }
+            }
+        }
+    }
+}
+
 /// Place redacted strings back into `msg`, following the same walk order as
 /// `collect_message_texts`.
 pub(super) fn replace_message_texts(msg: &mut Value, redacted: &[String], idx: &mut usize) {
@@ -70,6 +141,7 @@ pub(super) fn replace_message_texts(msg: &mut Value, redacted: &[String], idx: &
     if let Some(tool_calls) = msg.get_mut("tool_calls") {
         replace_tool_calls_texts(tool_calls, redacted, idx);
     }
+    replace_reasoning_texts(msg, redacted, idx);
 }
 
 pub(super) fn replace_content_texts(content: &mut Value, redacted: &[String], idx: &mut usize) {
@@ -330,7 +402,11 @@ pub(super) async fn stream_response(
 
 /// Emit any held-back text as a final synthetic delta event.
 pub(super) fn flush_carry(carry: &mut StreamCarry, vault: &Vault) -> String {
-    if carry.content.is_empty() && carry.args.is_empty() && carry.reasoning.is_empty() {
+    if carry.content.is_empty()
+        && carry.args.is_empty()
+        && carry.reasoning.is_empty()
+        && carry.reasoning_alt.is_empty()
+    {
         return String::new();
     }
     let mut deltas = Vec::new();
@@ -347,6 +423,14 @@ pub(super) fn flush_carry(carry: &mut StreamCarry, vault: &Vault) -> String {
         deltas.push(json!({
             "index": 0,
             "delta": { "reasoning_content": vault.restore(&held) },
+            "finish_reason": null
+        }));
+    }
+    if !carry.reasoning_alt.is_empty() {
+        let held = std::mem::take(&mut carry.reasoning_alt);
+        deltas.push(json!({
+            "index": 0,
+            "delta": { "reasoning": vault.restore(&held) },
             "finish_reason": null
         }));
     }
@@ -422,6 +506,11 @@ pub(super) fn rehydrate_sse_delta(value: &mut Value, carry: &mut StreamCarry, va
             let rehydrated = rehydrate_with_carry(reasoning, &mut carry.reasoning, vault);
             *reasoning = rehydrated;
         }
+        // OpenRouter streams reasoning as `reasoning` instead.
+        if let Some(Value::String(reasoning)) = delta.get_mut("reasoning") {
+            let rehydrated = rehydrate_with_carry(reasoning, &mut carry.reasoning_alt, vault);
+            *reasoning = rehydrated;
+        }
         if let Some(tool_calls) = delta.get_mut("tool_calls") {
             rehydrate_tool_calls(tool_calls, &mut carry.args, vault);
         }
@@ -429,9 +518,10 @@ pub(super) fn rehydrate_sse_delta(value: &mut Value, carry: &mut StreamCarry, va
 }
 
 /// Rehydrate the text-bearing fields of a complete (non-streaming) assistant
-/// message: content, reasoning content, and tool-call arguments.
+/// message: content, reasoning (`reasoning_content` or OpenRouter's `reasoning`),
+/// and tool-call arguments.
 pub(super) fn rehydrate_response_message(msg: &mut Value, vault: &Vault) {
-    for field in ["content", "reasoning_content"] {
+    for field in ["content", "reasoning_content", "reasoning"] {
         if let Some(Value::String(text)) = msg.get_mut(field) {
             *text = vault.restore(text);
         }
