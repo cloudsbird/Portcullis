@@ -970,7 +970,7 @@ pub(super) fn assert_outbound_clean(
         None => Ok(()),
     };
     decoded
-        .and_then(|()| gw.assert_clean_scoped(scope, &[assembled]))
+        .and_then(|()| gw.assert_clean_serialized(scope, &assembled))
         .map_err(|e| {
             metrics.blocked(if e.contains("residual") {
                 "residual_term"

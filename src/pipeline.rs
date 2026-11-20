@@ -570,6 +570,27 @@ impl Gateway {
     /// Index of the first segment that still contains a protected term, if any.
     /// Lets a caller say *where* a block happened without echoing the term.
     pub fn first_residual_term(&self, scope: Option<&str>, segments: &[String]) -> Option<usize> {
+        self.residual(scope, segments, true)
+    }
+
+    /// The taught-term check over one already-serialized body, on the raw text only.
+    ///
+    /// The proxy checks every decoded string of the body (and its JSON view) one by one
+    /// first; this second pass over the whole serialized body must not also build a
+    /// decoded view of it, which would hold several copies of a large request in
+    /// memory under the gateway lock.
+    pub fn assert_clean_serialized(&self, scope: Option<&str>, body: &str) -> Result<(), String> {
+        let seg = [body.to_string()];
+        if self.residual(scope, &seg, false).is_some() {
+            return Err("residual protected term in outbound".into());
+        }
+        if has_unclosed_placeholder(body) {
+            return Err("malformed placeholder in outbound".into());
+        }
+        Ok(())
+    }
+
+    fn residual(&self, scope: Option<&str>, segments: &[String], decode: bool) -> Option<usize> {
         let dict = self.dictionary(scope);
         let found_in = |text: &str| {
             dict.detect(text).iter().any(|span| {
@@ -580,9 +601,9 @@ impl Gateway {
         };
         // The decoded view too: a term after a JSON `\n`, or written with `\u` escapes,
         // is invisible to a match on the raw text.
-        segments
-            .iter()
-            .position(|seg| found_in(seg) || View::of(seg).is_some_and(|v| found_in(&v.text)))
+        segments.iter().position(|seg| {
+            found_in(seg) || (decode && View::of(seg).is_some_and(|v| found_in(&v.text)))
+        })
     }
 
     pub fn assert_clean_scoped(
