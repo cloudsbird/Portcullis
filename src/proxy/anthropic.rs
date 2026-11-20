@@ -440,19 +440,24 @@ pub(super) fn process_anthropic_sse_event(
 ) -> String {
     let mut out = String::new();
 
-    // If this event carries `message_stop`, flush any held-back placeholder
-    // text before emitting the stop event.
-    let is_message_stop = event.lines().any(|line| {
-        line.strip_prefix("data: ")
+    // Held text belongs to its block, so it is flushed before that block's
+    // `content_block_stop`; a delta after the stop would be dropped or rejected by a
+    // client. Anything still held is flushed before `message_stop`.
+    for line in event.lines() {
+        let Some(v) = line
+            .strip_prefix("data: ")
             .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-            .and_then(|v| {
-                v.get("type")
-                    .and_then(|t| t.as_str().map(|s| s == "message_stop"))
-            })
-            .unwrap_or(false)
-    });
-    if is_message_stop {
-        out.push_str(&flush_anthropic_carry(carry, vault));
+        else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("content_block_stop") => {
+                let index = v.get("index").and_then(Value::as_u64).unwrap_or(0);
+                out.push_str(&flush_anthropic_block(carry, index, vault));
+            }
+            Some("message_stop") => out.push_str(&flush_anthropic_carry(carry, vault)),
+            _ => {}
+        }
     }
 
     for line in event.lines() {
@@ -487,51 +492,45 @@ pub(super) fn rehydrate_anthropic_sse_delta(
     if value.get("type").and_then(|t| t.as_str()) != Some("content_block_delta") {
         return;
     }
+    let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
     let Some(delta) = value.get_mut("delta") else {
         return;
     };
     let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-    match delta_type {
-        "text_delta" => {
-            if let Some(Value::String(content)) = delta.get_mut("text") {
-                let rehydrated = rehydrate_with_carry(content, &mut carry.content, vault);
-                *content = rehydrated;
-            }
-        }
-        "input_json_delta" => {
-            if let Some(Value::String(partial_json)) = delta.get_mut("partial_json") {
-                let rehydrated = rehydrate_with_carry(partial_json, &mut carry.args, vault);
-                *partial_json = rehydrated;
-            }
-        }
-        _ => {}
+    let (field, json) = match delta_type {
+        "text_delta" => ("text", false),
+        "input_json_delta" => ("partial_json", true),
+        _ => return,
+    };
+    if let Some(Value::String(text)) = delta.get_mut(field) {
+        let (_, held) = carry.blocks.entry(index).or_insert((json, String::new()));
+        *text = rehydrate_with_carry(text, held, vault, json);
     }
 }
 
-/// Emit held-back Anthropic placeholder text as final synthetic deltas.
-pub(super) fn flush_anthropic_carry(carry: &mut StreamCarry, vault: &Vault) -> String {
-    if carry.content.is_empty() && carry.args.is_empty() {
+/// Emit block `index`'s held-back text as a synthetic delta event for that block.
+pub(super) fn flush_anthropic_block(carry: &mut StreamCarry, index: u64, vault: &Vault) -> String {
+    let Some((json, held)) = carry.blocks.remove(&index) else {
+        return String::new();
+    };
+    if held.is_empty() {
         return String::new();
     }
-    let mut events = Vec::new();
-    if !carry.content.is_empty() {
-        let held = std::mem::take(&mut carry.content);
-        let payload = json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": { "type": "text_delta", "text": vault.restore(&held) }
-        });
-        events.push(format!("event: content_block_delta\ndata: {payload}\n\n"));
-    }
-    if !carry.args.is_empty() {
-        let held = std::mem::take(&mut carry.args);
-        let payload = json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": { "type": "input_json_delta", "partial_json": vault.restore(&held) }
-        });
-        events.push(format!("event: content_block_delta\ndata: {payload}\n\n"));
-    }
-    events.join("")
+    let delta = if json {
+        json!({ "type": "input_json_delta", "partial_json": vault.restore_json(&held) })
+    } else {
+        json!({ "type": "text_delta", "text": vault.restore(&held) })
+    };
+    let payload = json!({ "type": "content_block_delta", "index": index, "delta": delta });
+    format!("event: content_block_delta\ndata: {payload}\n\n")
+}
+
+/// Emit every block's held-back text, each under its own index.
+pub(super) fn flush_anthropic_carry(carry: &mut StreamCarry, vault: &Vault) -> String {
+    let indices: Vec<u64> = carry.blocks.keys().copied().collect();
+    indices
+        .into_iter()
+        .map(|i| flush_anthropic_block(carry, i, vault))
+        .collect()
 }

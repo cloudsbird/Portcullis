@@ -18,7 +18,6 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 /// What the fake provider answers with.
-#[allow(dead_code)] // `Sse` is used by the streaming tests added with the per-index carry.
 #[derive(Clone)]
 enum Reply {
     Json(Value),
@@ -289,4 +288,221 @@ async fn a_blocked_request_explains_itself_in_anthropic_json() {
     let msg = err["error"]["message"].as_str().unwrap();
     assert!(msg.contains("new conversation"), "{msg}");
     assert!(h.forwarded().await.is_empty());
+}
+
+/// Hermes returns tool results as JSON text (`json.dumps({"output": ...})`), so every
+/// newline in command output arrives as the two characters `\n`. The escape letter must
+/// not be read as part of the next word: that leaked whole-word terms at the start of a
+/// line, and turned `\njane@acme.io` into the "email" `njane@acme.io`.
+#[tokio::test]
+async fn a_json_tool_result_neither_leaks_nor_corrupts_values() {
+    let mut store = Store::default();
+    store.teach_with("Ann", "PERSON", "global", true);
+    let h = Harness::new(store).await;
+    h.reply_with(chat_reply(json!({
+        "role": "assistant", "content": "<<PERSON_1>> uses <<EMAIL_1>>."
+    })))
+    .await;
+    let tool_output = r#"{"output": "owner:\nAnn\ncontact:\njane@acme.io\tAnn", "exit_code": 0}"#;
+    let resp = h
+        .chat(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "who owns it?"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "terminal", "arguments": "{\"cmd\":\"cat OWNERS\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "c1", "content": tool_output}
+            ]
+        }))
+        .await;
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    let reply: Value = resp.json().await.unwrap();
+    assert_eq!(
+        reply["choices"][0]["message"]["content"], "Ann uses jane@acme.io.",
+        "restored values must be exactly what was sent"
+    );
+
+    let sent = h.forwarded().await;
+    let content = sent[0]["messages"][2]["content"].as_str().unwrap();
+    assert!(
+        !content.contains("Ann"),
+        "whole-word term leaked: {content}"
+    );
+    assert!(!content.contains("jane@acme.io"), "email leaked: {content}");
+    assert_eq!(
+        content,
+        r#"{"output": "owner:\n<<PERSON_1>>\ncontact:\n<<EMAIL_1>>\t<<PERSON_1>>", "exit_code": 0}"#
+    );
+    serde_json::from_str::<Value>(content).expect("the redacted tool result is still valid JSON");
+}
+
+/// A non-ASCII taught term inside JSON text written with `ensure_ascii=True`.
+#[tokio::test]
+async fn a_unicode_escaped_taught_term_is_redacted() {
+    let h = Harness::new(taught(&[("José Ortega", "PERSON")])).await;
+    let resp = h
+        .chat(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "José Ortega asked"},
+                {"role": "tool", "tool_call_id": "c1",
+                 // `\u00e9`, built at runtime so no tool or editor can "helpfully" decode it.
+                 "content": format!(r#"{{"author": "Jos{}u00e9 Ortega"}}"#, '\\')}
+            ]
+        }))
+        .await;
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    let sent = h.forwarded().await;
+    assert_eq!(sent[0]["messages"][0]["content"], "<<PERSON_1>> asked");
+    assert_eq!(
+        sent[0]["messages"][1]["content"], r#"{"author": "<<PERSON_1>>"}"#,
+        "same person, same placeholder"
+    );
+}
+
+/// Tool-call arguments are JSON text, so a restored value is inserted JSON-escaped.
+#[tokio::test]
+async fn restored_tool_call_arguments_are_valid_json() {
+    let h = Harness::new(taught(&[(r#"Dana "DJ" Smith"#, "PERSON")])).await;
+    h.reply_with(chat_reply(json!({
+        "role": "assistant", "content": null, "tool_calls": [{
+            "id": "c1", "type": "function",
+            "function": {"name": "write", "arguments": "{\"text\":\"Hi <<PERSON_1>>\"}"}
+        }]
+    })))
+    .await;
+    let resp = h
+        .chat(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": r#"Write to Dana "DJ" Smith"#}]
+        }))
+        .await;
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    let reply: Value = resp.json().await.unwrap();
+    let args = reply["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(args).expect("arguments must stay valid JSON");
+    assert_eq!(parsed["text"], r#"Hi Dana "DJ" Smith"#);
+}
+
+fn sse(events: &[Value]) -> String {
+    let mut out: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
+/// Accumulate `tool_calls[].function.arguments` by index from an OpenAI SSE body.
+fn tool_args_by_index(body: &str) -> std::collections::BTreeMap<u64, String> {
+    let mut args = std::collections::BTreeMap::new();
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        for choice in v["choices"].as_array().into_iter().flatten() {
+            for call in choice["delta"]["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let idx = call["index"].as_u64().unwrap();
+                if let Some(a) = call["function"]["arguments"].as_str() {
+                    args.entry(idx).or_insert_with(String::new).push_str(a);
+                }
+            }
+        }
+    }
+    args
+}
+
+/// Parallel tool calls stream interleaved. A placeholder split across two events of
+/// one call must not be stitched into the other call.
+#[tokio::test]
+async fn parallel_streamed_tool_calls_keep_their_own_placeholders() {
+    let h = Harness::new(Store::default()).await;
+    let call = |index: u64, args: &str| {
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": index, "function": {"arguments": args}}
+        ]}}]})
+    };
+    h.reply_with(Reply::Sse(sse(&[
+        call(0, "{\"to\":\"<<EMA"),
+        call(1, "{\"to\":\"<<EMAIL_1>>\"}"),
+        call(0, "IL_1>>\"}"),
+        call(2, "{\"note\":\"a <<b"),
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+    ])))
+    .await;
+    let resp = h
+        .chat(json!({
+            "model": "m", "stream": true,
+            "messages": [{"role": "user", "content": "mail jane@acme.io twice"}]
+        }))
+        .await;
+    assert!(resp.status().is_success());
+    let args = tool_args_by_index(&resp.text().await.unwrap());
+    assert_eq!(args[&0], r#"{"to":"jane@acme.io"}"#);
+    assert_eq!(args[&1], r#"{"to":"jane@acme.io"}"#);
+    assert_eq!(
+        args[&2], r#"{"note":"a <<b"#,
+        "held text goes back to its own call"
+    );
+}
+
+/// Anthropic: held text is flushed into its own block, before that block's
+/// `content_block_stop`, and `input_json_delta` is restored JSON-escaped.
+#[tokio::test]
+async fn anthropic_stream_flushes_each_block_before_it_stops() {
+    let h = Harness::new(taught(&[(r#"Dana "DJ" Smith"#, "PERSON")])).await;
+    let ev = |v: Value| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap());
+    let body: String = [
+        ev(json!({"type": "message_start", "message": {"id": "m", "type": "message",
+            "role": "assistant", "content": [], "model": "c", "usage": {"input_tokens": 1, "output_tokens": 0}}})),
+        ev(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})),
+        ev(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "see <<x"}})),
+        ev(json!({"type": "content_block_stop", "index": 0})),
+        ev(json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t", "name": "w", "input": {}}})),
+        ev(json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"to\":\"<<PERS"}})),
+        ev(json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "ON_1>>\"}"}})),
+        ev(json!({"type": "content_block_stop", "index": 1})),
+        ev(json!({"type": "message_stop"})),
+    ]
+    .concat();
+    h.reply_with(Reply::Sse(body)).await;
+    let resp = h
+        .messages(json!({
+            "model": "c", "max_tokens": 5, "stream": true,
+            "messages": [{"role": "user", "content": r#"to Dana "DJ" Smith"#}]
+        }))
+        .await;
+    assert!(resp.status().is_success());
+    let text = resp.text().await.unwrap();
+
+    let events: Vec<Value> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|p| serde_json::from_str(p).ok())
+        .collect();
+    let (mut block0, mut json1, mut stopped0) = (String::new(), String::new(), false);
+    for e in &events {
+        match (e["type"].as_str().unwrap(), e["index"].as_u64()) {
+            ("content_block_delta", Some(0)) => {
+                assert!(!stopped0, "delta for block 0 after its stop: {text}");
+                block0.push_str(e["delta"]["text"].as_str().unwrap());
+            }
+            ("content_block_delta", Some(1)) => {
+                json1.push_str(e["delta"]["partial_json"].as_str().unwrap())
+            }
+            ("content_block_stop", Some(0)) => stopped0 = true,
+            _ => {}
+        }
+    }
+    assert_eq!(block0, "see <<x");
+    let input: Value = serde_json::from_str(&json1).expect("tool input stays valid JSON");
+    assert_eq!(input["to"], r#"Dana "DJ" Smith"#);
 }

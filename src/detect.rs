@@ -367,21 +367,28 @@ fn source_priority(source: &str) -> u8 {
 /// Merge spans, dropping overlaps: earliest start wins, then highest-priority
 /// source, then longest. This keeps the deterministic dictionary/regex layers
 /// ahead of the ONNX detector — it can add recall, never override the guarantee.
-pub fn merge(mut spans: Vec<Span>) -> Vec<Span> {
-    spans.sort_by(|a, b| {
+pub fn merge(spans: Vec<Span>) -> Vec<Span> {
+    merge_by(spans, |s| s)
+}
+
+/// [`merge`] for items that carry a span plus something else. The sort is stable, so
+/// among exact ties the item pushed first wins.
+pub fn merge_by<T>(mut items: Vec<T>, span: impl Fn(&T) -> &Span) -> Vec<T> {
+    items.sort_by(|a, b| {
+        let (a, b) = (span(a), span(b));
         a.start
             .cmp(&b.start)
             .then_with(|| source_priority(a.source).cmp(&source_priority(b.source)))
             .then_with(|| (b.end - b.start).cmp(&(a.end - a.start)))
     });
-    let mut out: Vec<Span> = Vec::new();
-    for s in spans {
+    let mut out: Vec<T> = Vec::new();
+    for item in items {
         if let Some(last) = out.last() {
-            if s.start < last.end {
+            if span(&item).start < span(last).end {
                 continue;
             }
         }
-        out.push(s);
+        out.push(item);
     }
     out
 }

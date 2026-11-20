@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
-use crate::detect::{detect_windowed, merge, Detector, DictionaryDetector, RegexDetector};
+use crate::detect::{detect_windowed, merge_by, Detector, DictionaryDetector, RegexDetector, Span};
+use crate::jsonview::{self, View};
 use crate::metrics::Metrics;
 use crate::store::Store;
 use crate::vault::Vault;
@@ -64,6 +65,18 @@ struct CachedSpan {
     start: usize,
     end: usize,
     label: String,
+    /// Layers of JSON escaping to decode from the raw slice to get the real value: 0
+    /// when the span was found in the raw text, otherwise the depth of the
+    /// [`View`] it was found in. The vault keys on the decoded value, so `José` in a
+    /// message and its escaped form in a JSON tool result get the same placeholder.
+    decode: u8,
+}
+
+impl CachedSpan {
+    /// The real value this span covers in `seg`.
+    fn value<'a>(&self, seg: &'a str) -> std::borrow::Cow<'a, str> {
+        jsonview::unescape_n(&seg[self.start..self.end], self.decode)
+    }
 }
 
 /// Why a scan refused to produce an outbound payload.
@@ -324,6 +337,11 @@ impl Gateway {
     /// builtin patterns, then the optional ML detector. Returns offsets only —
     /// never the matched text — so the result is safe to cache and can be applied
     /// against any session's vault.
+    ///
+    /// When the segment holds JSON escapes (see [`crate::jsonview`]) every layer runs
+    /// over the decoded view, and the dictionary over the raw text as well, so a taught
+    /// term that itself contains a backslash is still caught. View spans are mapped back
+    /// to raw ranges covering whole escape sequences.
     fn detect_spans(
         &mut self,
         scope: Option<&str>,
@@ -331,22 +349,33 @@ impl Gateway {
         seg: &str,
     ) -> (Vec<CachedSpan>, bool) {
         let mut failed = false;
-        let mut spans = dict.detect(seg);
-        spans.extend(self.regexes.detect(seg));
+        let view = View::of(seg);
+        let (text, depth) = match &view {
+            Some(v) => (v.text.as_str(), v.depth),
+            None => (seg, 0),
+        };
+
+        // (span in `text` coordinates, found in the view?)
+        let mut found: Vec<(Span, bool)> = Vec::new();
+        if view.is_some() {
+            found.extend(dict.detect(seg).into_iter().map(|s| (s, false)));
+        }
+        found.extend(dict.detect(text).into_iter().map(|s| (s, true)));
+        found.extend(self.regexes.detect(text).into_iter().map(|s| (s, true)));
         if let Some(extra) = &self.extra {
             // A third-party detector's offsets are not trusted to land on character
             // boundaries: slicing mid-character would panic, and a misaligned span
             // would redact the wrong bytes. Widen to the enclosing boundaries.
             //
-            // The segment goes to the detector in bounded windows, never whole: encoder
+            // The text goes to the detector in bounded windows, never whole: encoder
             // memory is quadratic in input length, so one long tool output would
             // otherwise take the process down.
-            spans.extend(
-                detect_windowed(extra.as_ref(), seg)
+            found.extend(
+                detect_windowed(extra.as_ref(), text)
                     .into_iter()
                     .filter_map(|mut s| {
-                        (s.start, s.end) = snap_to_boundaries(seg, s.start, s.end)?;
-                        Some(s)
+                        (s.start, s.end) = snap_to_boundaries(text, s.start, s.end)?;
+                        Some((s, true))
                     }),
             );
             // Any failed window fails the segment. The metric counts segments, not
@@ -356,20 +385,38 @@ impl Gateway {
                 failed = true;
             }
         }
+
+        // Everything in raw coordinates, so raw and view spans merge correctly.
+        let raw: Vec<(Span, u8)> = found
+            .into_iter()
+            .map(|(mut s, in_view)| match (&view, in_view) {
+                (Some(v), true) => {
+                    (s.start, s.end) = v.to_raw(s.start, s.end);
+                    (s, depth)
+                }
+                _ => (s, 0),
+            })
+            .filter(|(s, _)| s.start < s.end)
+            .collect();
+
         let mut kept = Vec::new();
-        for s in merge(spans) {
-            let real = &seg[s.start..s.end];
-            if self.store.is_allowed_for(scope, real) {
-                continue;
-            }
-            if s.source != "dictionary" && !self.is_known(scope, real) {
-                self.push_suggestion(scope, real);
-            }
-            kept.push(CachedSpan {
+        for (s, decode) in merge_by(raw, |(s, _)| s) {
+            let span = CachedSpan {
                 start: s.start,
                 end: s.end,
                 label: s.label,
-            });
+                decode,
+            };
+            let real = span.value(seg);
+            if self.store.is_allowed_for(scope, &real) {
+                continue;
+            }
+            // Secrets are not candidates for teaching, and must not sit in a list an
+            // admin endpoint returns.
+            if s.source != "dictionary" && span.label != "SECRET" && !self.is_known(scope, &real) {
+                self.push_suggestion(scope, &real);
+            }
+            kept.push(span);
         }
         (kept, failed)
     }
@@ -380,7 +427,7 @@ impl Gateway {
         let mut cursor = 0usize;
         for s in spans {
             out.push_str(&seg[cursor..s.start]);
-            out.push_str(&vault.placeholder_for(&s.label, &seg[s.start..s.end]));
+            out.push_str(&vault.placeholder_for(&s.label, &s.value(seg)));
             cursor = s.end;
         }
         out.push_str(&seg[cursor..]);
@@ -507,11 +554,18 @@ impl Gateway {
     /// Lets a caller say *where* a block happened without echoing the term.
     pub fn first_residual_term(&self, scope: Option<&str>, segments: &[String]) -> Option<usize> {
         let dict = self.dictionary(scope);
-        segments.iter().position(|seg| {
-            dict.detect(seg)
-                .iter()
-                .any(|span| !self.store.is_allowed_for(scope, &seg[span.start..span.end]))
-        })
+        let found_in = |text: &str| {
+            dict.detect(text).iter().any(|span| {
+                !self
+                    .store
+                    .is_allowed_for(scope, &text[span.start..span.end])
+            })
+        };
+        // The decoded view too: a term after a JSON `\n`, or written with `\u` escapes,
+        // is invisible to a match on the raw text.
+        segments
+            .iter()
+            .position(|seg| found_in(seg) || View::of(seg).is_some_and(|v| found_in(&v.text)))
     }
 
     pub fn assert_clean_scoped(
