@@ -18,6 +18,9 @@ pub(super) fn collect_anthropic_texts(body: &mut Value, out: &mut Vec<String>) {
             collect_anthropic_message(msg, out);
         }
     }
+    if let Some(tools) = body.get_mut("tools") {
+        collect_descriptions(tools, out);
+    }
 }
 
 pub(super) fn collect_anthropic_system(system: &mut Value, out: &mut Vec<String>) {
@@ -106,6 +109,9 @@ pub(super) fn replace_anthropic_texts(body: &mut Value, redacted: &[String], idx
         for msg in messages.iter_mut() {
             replace_anthropic_message(msg, redacted, idx);
         }
+    }
+    if let Some(tools) = body.get_mut("tools") {
+        replace_descriptions(tools, redacted, idx);
     }
 }
 
@@ -202,7 +208,7 @@ pub async fn anthropic_messages(
 ) -> Response {
     match handle_anthropic(state, headers, body).await {
         Ok(resp) => resp,
-        Err((status, msg)) => (status, msg).into_response(),
+        Err((status, msg)) => error_response(Dialect::Anthropic, status, msg),
     }
 }
 

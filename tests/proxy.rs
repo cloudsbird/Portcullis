@@ -382,11 +382,16 @@ async fn signed_reasoning_with_a_taught_term_is_blocked_with_its_path() {
         .unwrap();
 
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
-    let err = resp.text().await.unwrap();
-    assert_eq!(
-        err,
-        "residual protected term in outbound at messages[0].reasoning_details[0].text"
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "residual_term");
+    let msg = err["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains(
+            "residual protected term in outbound at messages[0].reasoning_details[0].text"
+        ),
+        "{msg}"
     );
+    assert!(msg.contains("new conversation"), "{msg}");
     assert!(
         bodies.lock().await.is_empty(),
         "blocked request was forwarded"

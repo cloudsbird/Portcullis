@@ -195,7 +195,7 @@ pub async fn chat_completions(
 ) -> Response {
     match handle(state, headers, body).await {
         Ok(resp) => resp,
-        Err((status, msg)) => (status, msg).into_response(),
+        Err((status, msg)) => error_response(Dialect::OpenAi, status, msg),
     }
 }
 
@@ -229,6 +229,11 @@ pub(super) async fn handle(
         let mut msg = msg.clone();
         collect_message_texts(&mut msg, &mut texts_to_redact);
         redacted_messages.push(msg);
+    }
+    // Tool definitions are text the provider reads too (see `collect_descriptions`).
+    let mut redacted_tools = body.get("tools").cloned();
+    if let Some(tools) = redacted_tools.as_mut() {
+        collect_descriptions(tools, &mut texts_to_redact);
     }
 
     // Redact all text-bearing strings in one batch (better cache hit rate).
@@ -269,10 +274,16 @@ pub(super) async fn handle(
         for msg in &mut redacted_messages {
             replace_message_texts(msg, &redacted_texts, &mut idx);
         }
+        if let Some(tools) = redacted_tools.as_mut() {
+            replace_descriptions(tools, &redacted_texts, &mut idx);
+        }
     }
 
     let mut upstream_body = body.clone();
     upstream_body["messages"] = json!(redacted_messages);
+    if let Some(tools) = redacted_tools {
+        upstream_body["tools"] = tools;
+    }
 
     // Invariant 4: fail-closed outbound assertion — run over the ENTIRE assembled
     // payload, not only the strings we knew to redact. If the walker failed to

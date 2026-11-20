@@ -1,7 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use regex::Regex;
 use sha2::{Digest, Sha256};
 
 use crate::detect::{detect_windowed, merge, Detector, DictionaryDetector, RegexDetector};
@@ -38,6 +39,19 @@ fn snap_to_boundaries(seg: &str, start: usize, end: usize) -> Option<(usize, usi
         end += 1;
     }
     (start < end).then_some((start, end))
+}
+
+/// A placeholder-shaped token (`<<EMAIL_1`) that is never closed with `>>`.
+///
+/// Only that shape counts. A bare `<<` is ordinary text: shell heredocs (`cat <<EOF`),
+/// C++ streams and bit shifts all have one with no `>>` anywhere in the request.
+fn has_unclosed_placeholder(seg: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"<<\s*[A-Z][A-Z0-9_]*_[0-9]+\s*(>>)?")
+            .expect("placeholder shape regex is valid")
+    });
+    re.captures_iter(seg).any(|c| c.get(1).is_none())
 }
 
 /// Delta-cache size at which it is flushed, so a long-lived proxy cannot grow it
@@ -506,10 +520,8 @@ impl Gateway {
         outbound: &[String],
     ) -> Result<(), String> {
         self.assert_no_terms_scoped(scope, outbound)?;
-        for seg in outbound {
-            if seg.contains("<<") && !seg.contains(">>") {
-                return Err("malformed placeholder in outbound".into());
-            }
+        if outbound.iter().any(|seg| has_unclosed_placeholder(seg)) {
+            return Err("malformed placeholder in outbound".into());
         }
         Ok(())
     }

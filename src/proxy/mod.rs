@@ -333,6 +333,102 @@ async fn send_upstream(
     }
 }
 
+/// Which API a request came in on, so an error goes back in that API's own JSON shape
+/// and the client's SDK shows its message instead of a parse failure.
+#[derive(Clone, Copy)]
+pub(super) enum Dialect {
+    OpenAi,
+    Anthropic,
+}
+
+/// Turn an internal `(status, message)` into a provider-shaped JSON error.
+///
+/// Status codes are kept as they were, so client retry behaviour does not change. The
+/// message says plainly whether anything reached the provider and what to do next; the
+/// original text is kept in it (in parentheses) for logs and searches. No message ever
+/// contains a protected term or value: they only name fields.
+pub(super) fn error_response(dialect: Dialect, status: StatusCode, raw: String) -> Response {
+    let (code, message) = explain_error(status, &raw);
+    let body = match dialect {
+        Dialect::OpenAi => json!({
+            "error": { "message": message, "type": "portcullis_error", "code": code }
+        }),
+        Dialect::Anthropic => json!({
+            "type": "error",
+            "error": { "type": anthropic_error_type(status), "message": message }
+        }),
+    };
+    (status, Json(body)).into_response()
+}
+
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 | 422 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        _ => "api_error",
+    }
+}
+
+/// `(code, human message)` for an internal error message.
+fn explain_error(status: StatusCode, raw: &str) -> (&'static str, String) {
+    const BLOCKED: &str = "Portcullis blocked this request, so nothing was sent to the provider";
+    if let Some(rest) = raw.strip_prefix("residual protected term in outbound") {
+        let field = rest.trim_start_matches(" at ").trim();
+        let place = if field.is_empty() {
+            String::new()
+        } else {
+            format!(" (in {field})")
+        };
+        let hint = if ["reasoning", "thinking", "signature"]
+            .iter()
+            .any(|k| field.contains(k))
+        {
+            "It is in signed reasoning from an earlier turn, which cannot be edited without the provider rejecting it. Start a new conversation."
+        } else if field.ends_with(".name")
+            || field.contains("tool_call_id")
+            || field.contains(" key")
+            || field.ends_with(".id")
+        {
+            "It is in a name or identifier the provider matches on, which cannot be replaced. Rename it, or unteach the term (or allow it) if it does not need hiding."
+        } else {
+            "Unteach the term (or allow it) if it does not need hiding; otherwise report this field as a Portcullis bug."
+        };
+        return (
+            "residual_term",
+            format!("{BLOCKED}: a term you taught is still present{place}. {hint} ({raw})"),
+        );
+    }
+    if raw.starts_with("malformed placeholder") {
+        return (
+            "malformed_placeholder",
+            format!("{BLOCKED}: it contains an unfinished placeholder such as `<<EMAIL_1` with no closing `>>`. Remove it from the conversation. ({raw})"),
+        );
+    }
+    if raw.starts_with("detector failed") {
+        return (
+            "detector_failed",
+            format!("{BLOCKED}: the ML detector failed and PORTCULLIS_DETECTOR_FAIL_CLOSED is on. Retry, or check the Portcullis log. ({raw})"),
+        );
+    }
+    if raw.starts_with("upstream ") {
+        return (
+            "upstream_error",
+            format!("Portcullis could not get a response from the provider ({raw})."),
+        );
+    }
+    let code = match status.as_u16() {
+        400 | 422 => "invalid_request",
+        401 => "unauthorized",
+        403 => "forbidden",
+        _ => "portcullis_error",
+    };
+    (code, format!("Portcullis: {raw}"))
+}
+
 /// One log line per request. Bodies and headers are never logged, so no prompt
 /// content, term or credential can end up in the logs.
 async fn log_requests(State(state): State<ProxyState>, req: Request, next: Next) -> Response {
@@ -729,14 +825,136 @@ pub(super) fn outbound_strings(body: &Value) -> (Vec<String>, Vec<String>) {
     (strings, paths)
 }
 
+/// Shortest string treated as a base64 blob when it is not a `data:` URL. Real image,
+/// audio and file payloads are far larger; a short value under a `data` key is more
+/// likely text, and text keeps being checked.
+const MIN_BASE64_BLOB: usize = 1024;
+
+fn looks_base64(s: &str) -> bool {
+    s.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_' | b'\r' | b'\n')
+    })
+}
+
+/// A `data:…;base64,…` URL whose payload really is base64.
+fn is_base64_data_url(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("data:") else {
+        return false;
+    };
+    match rest.split_once(";base64,") {
+        Some((media_type, payload)) => !media_type.contains(',') && looks_base64(payload),
+        None => false,
+    }
+}
+
+/// A binary payload carried in a request: a base64 image, audio clip or file.
+///
+/// Portcullis forwards these unchanged; it never redacted pixels or audio. Checking them
+/// for taught terms only finds noise: a megabyte of base64 contains almost any short
+/// word, ignoring case, so one image would block every turn of a conversation. Text
+/// inside an image is a documented limitation (docs/threat-model.md).
+fn is_binary_payload(key: &str, value: &str, parent: &serde_json::Map<String, Value>) -> bool {
+    if is_base64_data_url(value) {
+        return true;
+    }
+    let blob = value.len() >= MIN_BASE64_BLOB && looks_base64(value);
+    match key {
+        // Anthropic `source: {type: "base64", data}`; OpenAI `input_audio: {data, format}`.
+        "data" => {
+            blob && (parent.get("type").and_then(Value::as_str) == Some("base64")
+                || parent.contains_key("format"))
+        }
+        // OpenAI file parts: `file: {file_data, filename}`.
+        "file_data" => blob,
+        _ => false,
+    }
+}
+
+/// `body` with every binary payload (see [`is_binary_payload`]) replaced by `""`. Only
+/// for the outbound check; the request is forwarded as it was.
+fn without_binary_payloads(body: &Value) -> Value {
+    fn strip(v: &mut Value) {
+        match v {
+            Value::Object(map) => {
+                let binary: Vec<String> = map
+                    .iter()
+                    .filter(|(k, x)| matches!(x, Value::String(s) if is_binary_payload(k, s, map)))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in binary {
+                    map.insert(k, Value::String(String::new()));
+                }
+                for (_, x) in map.iter_mut() {
+                    strip(x);
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip),
+            Value::String(s) if is_base64_data_url(s) => s.clear(),
+            _ => {}
+        }
+    }
+    let mut checked = body.clone();
+    strip(&mut checked);
+    checked
+}
+
+/// Every free-text `description` under a tool definition: the tool's own and its
+/// parameters'. The provider reads them, so a taught term there is redacted like any
+/// other text. Names, types and enums are protocol and stay as sent.
+pub(super) fn collect_descriptions(v: &mut Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) => {
+            for (k, x) in map.iter_mut() {
+                match x {
+                    Value::String(s) if k == "description" => out.push(std::mem::take(s)),
+                    _ => collect_descriptions(x, out),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for x in items {
+                collect_descriptions(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Mirror of [`collect_descriptions`]: same walk, same order.
+pub(super) fn replace_descriptions(v: &mut Value, redacted: &[String], idx: &mut usize) {
+    match v {
+        Value::Object(map) => {
+            for (k, x) in map.iter_mut() {
+                match x {
+                    Value::String(s) if k == "description" => {
+                        *s = redacted[*idx].clone();
+                        *idx += 1;
+                    }
+                    _ => replace_descriptions(x, redacted, idx),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for x in items {
+                replace_descriptions(x, redacted, idx);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The fail-closed outbound check (invariant 4), shared by both providers' handlers.
 /// Counts a block in the metrics by reason.
+///
+/// Binary payloads are left out of **both** passes (see [`is_binary_payload`]); they are
+/// still forwarded unchanged.
 pub(super) fn assert_outbound_clean(
     gw: &Gateway,
     metrics: &crate::Metrics,
     scope: Option<&str>,
     body: &Value,
 ) -> Result<(), (StatusCode, String)> {
+    let body = &without_binary_payloads(body);
     let assembled =
         serde_json::to_string(body).map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     // Decoded strings first, so a block names the field it came from.
