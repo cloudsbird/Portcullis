@@ -117,6 +117,48 @@ Worth alerting on: `increase(portcullis_blocked_total{reason=~"residual_term|mal
 (the fail-closed assertion fired — something nearly leaked), a sustained non-zero
 `portcullis_gateway_lock_wait_seconds`, and 5xx or `timeout` in `portcullis_upstream_responses_total`.
 
+### Errors a client sees
+
+A blocked or failed request gets an error in the JSON shape of the API it called, so the
+client's SDK shows a readable message (OpenAI: `{"error": {"message", "type":
+"portcullis_error", "code"}}`; Anthropic: `{"type": "error", "error": {"type", "message"}}`).
+Status codes are unchanged. The message says whether anything reached the provider, names
+the field (never the term), and says what to do.
+
+| `code` | Status | Meaning | What to do |
+|---|---|---|---|
+| `residual_term` | 502 | a taught term is still in a field that cannot be redacted (a tool or message `name`, signed reasoning) | rename it; unteach or allow the term; for signed reasoning, start a new conversation |
+| `malformed_placeholder` | 502 | an unfinished `<<LABEL_N` is in the request | remove it from the conversation |
+| `detector_failed` | 503 | the ML detector failed and `PORTCULLIS_DETECTOR_FAIL_CLOSED` is on | retry; check the log |
+| `upstream_error` | 502 | the provider could not be reached or timed out | check the provider |
+
+Nothing was sent to the provider for the first three.
+
+## What the patterns hide, and what they leave alone
+
+The regex layer is tuned for agent traffic, where logs, configs and package pins are the
+norm. It hides emails, phone numbers, card numbers (Luhn-checked), routable IP addresses
+and **secrets** (`SECRET`): provider API keys (`sk-…`, `sk-ant-…`, `sk-or-v1-…`), AWS key
+IDs, GitHub/GitLab/Slack/Google/Stripe tokens, JWTs, PEM private keys, the password in
+`scheme://user:pass@host`, `Bearer` tokens, and the value of `PASSWORD=…`,
+`"api_key": "…"` and similar when it has a letter and a digit. Secrets are prefix-anchored;
+there is no entropy heuristic, which would hit every git SHA and base64 blob.
+
+Left alone on purpose, because hiding them stops an agent from reading its own setup:
+timestamps and dates, `127.0.0.0/8`, `0.0.0.0`, `255.x` netmasks, package pins like
+`react@18.3.1`, `git@github.com:` remotes, build and version numbers, UUIDs and hashes.
+
+Trade-offs to know:
+
+- A bare run of digits (`4155550132`) counts as a phone only with a leading `+`; written
+  with separators (`415-555-0132`) it is always caught. In agent traffic such runs are
+  overwhelmingly IDs and timestamps.
+- A four-part version such as `1.2.3.4` is indistinguishable from an IP address and is
+  hidden. Private ranges (`10.x`, `192.168.x`) are hidden too.
+- Use the allow-list for any value the model needs to see:
+  `curl -X POST :8080/allow -H "Authorization: Bearer $TOKEN" -d '{"term":"10.0.1.3"}'`.
+  `POST /scan {"text": …}` shows what the provider would receive.
+
 Not implemented: **OTLP / distributed tracing.** Metrics are Prometheus-only, and logs remain
 structured JSON (`PORTCULLIS_LOG_FORMAT=json`).
 
@@ -180,7 +222,7 @@ it an open redaction proxy for your provider key.
 | `PORTCULLIS_ANTHROPIC_UPSTREAM_URL` | `https://api.anthropic.com/v1/messages` | Anthropic upstream |
 | `PORTCULLIS_ANTHROPIC_KEY` | — | sent as `x-api-key` |
 | `PORTCULLIS_ANTHROPIC_VERSION` | `2023-06-01` | default when the client sends none |
-| `PORTCULLIS_ADMIN_TOKEN` | — | guards `/teach`, `/unteach`, `/terms`, `/suggestions`; **unset → 503** |
+| `PORTCULLIS_ADMIN_TOKEN` | — | guards `/teach`, `/unteach`, `/terms`, `/suggestions`, `/allow`, `/unallow`, `/scan`; **unset → 503** |
 | `PORTCULLIS_STORE` | `store.json` | learned-term store, written `0600` |
 | `PORTCULLIS_MODEL` | — | named detector from the registry ([MODELS.md](MODELS.md)) |
 | `PORTCULLIS_MODELS` | `portcullis.models.json` | registry path |

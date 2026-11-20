@@ -46,6 +46,13 @@ originals**, so the cache itself is not a plaintext corpus.
    or ML detectors over the assembled body: JSON is full of numbers (timestamps, token
    counts) that look like phone numbers, so it would reject ordinary requests. A value
    that only a detector could have caught, and missed, is not stopped here.
+   Text that is JSON (tool results, tool-call arguments) is also checked in decoded
+   form, so a term after an escaped newline or written with `\u` escapes is caught.
+   Binary payloads (base64 images, audio, files) are left out of the check: they are
+   forwarded unchanged and were never redacted, and a megabyte of base64 contains almost
+   any short term by chance. Text *inside* an image is therefore not protected.
+   "Malformed placeholder" means a placeholder-shaped `<<LABEL_N` with no `>>`; a bare
+   `<<` (a shell heredoc) is ordinary text.
    An ML detector **failure** (as opposed to a miss) is fail-open by default: the
    segment keeps dictionary and regex coverage, the failure is counted in
    `portcullis_detector_errors_total`, and the scan is not cached so the next turn

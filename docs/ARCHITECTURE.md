@@ -16,7 +16,7 @@ flowchart TD
     C -- yes --> D["re-emit the REDACTED form<br/>(never the raw bytes)"]
     C -- no --> E["detect spans"]
     E --> E1["1. dictionary<br/>taught terms = the guarantee"]
-    E1 --> E2["2. regex<br/>email / phone / card / IP"]
+    E1 --> E2["2. regex<br/>email / phone / card / IP / secret"]
     E2 --> E3["3. ONNX GLiNER2<br/>best-effort recall"]
     E3 --> F["merge<br/>dictionary then regex then model"]
     F --> G["vault: real value &#8596; stable placeholder"]
@@ -83,7 +83,7 @@ Segments are scanned by three independent detectors, then merged:
 ```mermaid
 flowchart LR
     S["segment"] --> D1["DictionaryDetector<br/>taught terms + aliases"]
-    S --> D2["RegexDetector<br/>EMAIL PHONE CARD IP"]
+    S --> D2["RegexDetector<br/>EMAIL PHONE CARD IP SECRET"]
     S --> D3["OnnxDetector<br/>GLiNER2-PII"]
     D1 --> M["merge()"]
     D2 --> M
@@ -170,14 +170,28 @@ For `stream: true`, the *request* path is unchanged (redact, assert, forward). O
 
 A placeholder can be split across two **complete** SSE events — LLM tokens map roughly
 1:1 onto deltas — so a carry buffer withholds an unmatched `<<` until a later event
-completes it, then flushes at `[DONE]` (OpenAI) or `message_stop` (Anthropic). Without
-this, the client would see half-placeholders like `<<EMAI` followed by `L_1>>`.
+completes it, then flushes at `[DONE]` (OpenAI) or before the block's
+`content_block_stop` (Anthropic). Without this, the client would see half-placeholders like
+`<<EMAI` followed by `L_1>>`. Tool-call arguments keep one buffer per call `index`, because
+parallel calls stream interleaved, and their values are restored JSON-escaped.
+
+## JSON text
+
+Agents send JSON *as text*: Hermes returns every tool result as `json.dumps(...)`, and
+tool-call arguments are JSON strings. There a newline is the two characters `\n`, which
+would glue the escape letter onto the next word (`\nAnn` has no word boundary before
+`Ann`). `src/jsonview.rs` builds a decoded view (up to two layers) with a map back to the
+raw offsets; every detector runs over it, and the dictionary over the raw text too. Spans
+map back over whole escape sequences, so the placeholder keeps the JSON valid, and the
+vault keys on the decoded value.
 
 ## Fail-closed behaviour
 
 `assert_clean` runs over the **entire serialized outbound payload** — not just the strings
 the redactor happened to collect. If a protected term survives anywhere in the payload, or
-a placeholder is malformed, the request is **not forwarded** and the client gets a 502.
+a placeholder-shaped `<<LABEL_N` is left unclosed, the request is **not forwarded** and
+the client gets a 502 with a JSON error naming the field. Binary payloads (base64 images,
+audio, files) are excluded from the check; tool `description`s are redacted like messages.
 The provider never receives a payload that failed its own check.
 
 ## Component map
@@ -187,7 +201,8 @@ The provider never receives a payload that failed its own check.
 | `src/main.rs` | CLI: `teach` / `unteach` / `scan` / `serve` |
 | `src/proxy/` | HTTP surface — `mod.rs` (state, routing, upstream), `openai.rs` and `anthropic.rs` (request redaction, rehydration, SSE), `stream.rs` (split-placeholder carry), `admin.rs` (the learning endpoints) |
 | `src/pipeline.rs` | `Gateway` — the delta cache, `teach`/`unteach`, `process`, `assert_clean`, `rehydrate` |
-| `src/detect.rs` | `DictionaryDetector`, `RegexDetector`, `merge` priority, the `Detector` trait |
+| `src/detect.rs` | `DictionaryDetector`, `RegexDetector` (patterns and context validators), `merge` priority, the `Detector` trait |
+| `src/jsonview.rs` | decoded view of JSON text with a map back to raw offsets |
 | `src/detect_onnx.rs` | `OnnxDetector` — GLiNER2-PII in-process via `ort` (feature `onnx`) |
 | `src/vault.rs` | Value ⇄ stable placeholder mapping, tolerant restore |
 | `src/store.rs` | The taught terms — deny/allow, persisted to `store.json` |
