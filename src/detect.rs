@@ -158,11 +158,22 @@ impl Detector for DictionaryDetector {
     }
 }
 
-/// `Some(false)`-style gate run on a regex hit before it becomes a span.
-type Validator = fn(&str) -> bool;
+/// A gate run on a regex hit before it becomes a span. It sees the whole text and the
+/// hit's byte range, because the `regex` crate has no lookaround and most false
+/// positives are only visible from the characters around a match.
+type Validator = fn(text: &str, start: usize, end: usize) -> bool;
+
+struct Pattern {
+    re: Regex,
+    label: &'static str,
+    /// Capture group that is the span (0: the whole match). Lets `user:PASS@` or
+    /// `Bearer TOKEN` redact just the credential.
+    group: usize,
+    validator: Option<Validator>,
+}
 
 pub struct RegexDetector {
-    patterns: Vec<(Regex, &'static str, Option<Validator>)>,
+    patterns: Vec<Pattern>,
 }
 
 fn digits(s: &str) -> impl Iterator<Item = u32> + '_ {
@@ -195,37 +206,229 @@ fn luhn_valid(s: &str) -> bool {
     sum.is_multiple_of(10)
 }
 
-/// A phone-shaped run needs enough digits to be a number at all, and an ISO date
-/// (`2026-10-02`) is not one.
-fn plausible_phone(s: &str) -> bool {
-    let n = digits(s).count();
-    if n < 7 {
+fn char_before(text: &str, i: usize) -> Option<char> {
+    text[..i].chars().next_back()
+}
+
+fn char_after(text: &str, i: usize) -> Option<char> {
+    text[i..].chars().next()
+}
+
+/// The two characters before `i`, nearest first.
+fn two_before(text: &str, i: usize) -> (Option<char>, Option<char>) {
+    let mut it = text[..i].chars().rev();
+    (it.next(), it.next())
+}
+
+fn two_after(text: &str, i: usize) -> (Option<char>, Option<char>) {
+    let mut it = text[i..].chars();
+    (it.next(), it.next())
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn is_digit(c: Option<char>) -> bool {
+    c.is_some_and(|c| c.is_ascii_digit())
+}
+
+/// The match continues a dotted or timed number: `1.` before it, or `.5` / `:44` after.
+fn continues_a_number(text: &str, start: usize, end: usize) -> bool {
+    let (b1, b2) = two_before(text, start);
+    let (a1, a2) = two_after(text, end);
+    (matches!(b1, Some('.' | ':')) && is_digit(b2))
+        || (matches!(a1, Some('.' | ':')) && is_digit(a2))
+}
+
+/// An email address, not a package pin (`react@18.3.1`), an SSH remote
+/// (`git@github.com:…`) or the userinfo of a URL (`scheme://user:pass@host`).
+fn email_ok(text: &str, start: usize, end: usize) -> bool {
+    let m = &text[start..end];
+    let Some((local, domain)) = m.split_once('@') else {
+        return false;
+    };
+    let tld = domain.rsplit('.').next().unwrap_or("");
+    if !(2..=24).contains(&tld.chars().count()) || !tld.chars().all(char::is_alphabetic) {
         return false;
     }
-    let b = s.as_bytes();
-    let iso_date = b.len() == 10
-        && b.iter().enumerate().all(|(i, c)| match i {
-            4 | 7 => *c == b'-',
-            _ => c.is_ascii_digit(),
-        });
-    !iso_date
+    if local.eq_ignore_ascii_case("git") {
+        return false;
+    }
+    let before = &text[..start];
+    let token = before
+        .rfind(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '('))
+        .map_or(before, |i| &before[i + 1..]);
+    !token.contains("://")
+}
+
+/// A routable address. Loopback, `0.0.0.0` and `255.x` netmasks are configuration, not
+/// personal data, and hiding them stops an agent from reading its own setup. Private
+/// ranges are still hidden (they map your network); allow-list one to see it.
+fn ip_ok(text: &str, start: usize, end: usize) -> bool {
+    let octets: Vec<u32> = text[start..end]
+        .split('.')
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    if octets.len() != 4 || octets.iter().any(|&o| o > 255) {
+        return false;
+    }
+    if octets[0] == 127 || octets[0] == 255 || octets.iter().all(|&o| o == 0) {
+        return false;
+    }
+    // Part of a longer dotted run (a version like 1.2.3.4.5). A `:port` is fine.
+    let (b1, b2) = two_before(text, start);
+    let (a1, a2) = two_after(text, end);
+    !((b1 == Some('.') && is_digit(b2)) || (a1 == Some('.') && is_digit(a2)))
+}
+
+/// A card number: Luhn-valid, and starting like an issued card (2–6), which rules out
+/// millisecond timestamps (`1731556800000`) that happen to pass Luhn.
+fn card_ok(text: &str, start: usize, end: usize) -> bool {
+    let m = &text[start..end];
+    luhn_valid(m)
+        && m.chars().next().is_some_and(|c| ('2'..='6').contains(&c))
+        && !continues_a_number(text, start, end)
+}
+
+fn phone_shape() -> &'static [Regex; 2] {
+    static RES: std::sync::OnceLock<[Regex; 2]> = std::sync::OnceLock::new();
+    RES.get_or_init(|| {
+        [
+            // Starts like a date: 2026-11-14, 2026.11.14
+            Regex::new(r"^\d{4}[-.]\d{1,2}[-.]\d{1,2}").expect("valid"),
+            // Is a date: 14-11-2026, 1.2.26
+            Regex::new(r"^\d{1,2}[-.]\d{1,2}[-.]\d{2,4}$").expect("valid"),
+        ]
+    })
+}
+
+/// A phone number, not a timestamp, date, version, build number, ID or table row.
+///
+/// Trades recall for precision on purpose: a bare run of digits (`4155550132`) is only a
+/// phone with a leading `+`, because in agent traffic such runs are overwhelmingly IDs
+/// and timestamps. Written with separators, or in E.164 form, it is still caught.
+fn phone_ok(text: &str, start: usize, end: usize) -> bool {
+    let m = &text[start..end];
+    if char_before(text, start).is_some_and(is_ident)
+        || char_after(text, end).is_some_and(is_ident)
+        || continues_a_number(text, start, end)
+        || m.contains("  ")
+        || phone_shape().iter().any(|re| re.is_match(m))
+    {
+        return false;
+    }
+    let groups: Vec<&str> = m
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|g| !g.is_empty())
+        .collect();
+    let n: usize = groups.iter().map(|g| g.len()).sum();
+    if groups.len() == 1 {
+        return m.starts_with('+') && (8..=15).contains(&n);
+    }
+    // A card-shaped run that fails Luhn (4111 1111 1111 1112) is still hidden.
+    let card_shaped = groups.len() >= 3
+        && (13..=19).contains(&n)
+        && groups[..groups.len() - 1].iter().all(|g| g.len() == 4);
+    if card_shaped {
+        return true;
+    }
+    if !(7..=15).contains(&n) {
+        return false;
+    }
+    if m.contains('.') {
+        // Dots only in the classic 415.555.0132 form, never mixed with other separators.
+        let seps_are_dots = m
+            .trim_start_matches('+')
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.');
+        return seps_are_dots
+            && (3..=4).contains(&groups.len())
+            && groups.iter().all(|g| (2..=4).contains(&g.len()));
+    }
+    true
+}
+
+/// `Bearer <token>`: a real token has a digit; `Bearer YOUR_TOKEN_HERE` does not.
+fn bearer_ok(text: &str, start: usize, end: usize) -> bool {
+    text[start..end].chars().any(|c| c.is_ascii_digit())
+}
+
+/// The value of `PASSWORD=…`, `"api_key": "…"`: it has a letter and a digit (so not
+/// `null`, `4096` or `os.environ`), and it is not a function call.
+fn assigned_secret_ok(text: &str, start: usize, end: usize) -> bool {
+    let v = &text[start..end];
+    v.chars().any(|c| c.is_ascii_digit())
+        && v.chars().any(char::is_alphabetic)
+        && char_after(text, end) != Some('(')
 }
 
 impl RegexDetector {
     pub fn new() -> Self {
-        // Order matters for ties: at the same start and length, the earlier pattern
-        // wins in `merge`, so the more specific label goes first. A card that fails
-        // Luhn is still caught as a PHONE-shaped run, so validation never lowers recall.
-        let defs: &[(&str, &str, Option<Validator>)] = &[
-            (r"[\w.+-]+@[\w-]+\.[\w.-]+", "EMAIL", None),
-            (r"\b(?:\d[ -]?){12,18}\d\b", "CARD", Some(luhn_valid)),
-            (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "IP", None),
-            (r"\+?\d[\d\s().-]{6,}\d", "PHONE", Some(plausible_phone)),
+        // Order matters for ties: at the same start and length the earlier pattern wins
+        // in `merge`, so the more specific label goes first. A card that fails Luhn is
+        // still caught as a PHONE-shaped run, so validation never lowers recall there.
+        //
+        // Secrets are prefix-anchored formats only. Entropy heuristics would hit every
+        // git SHA and base64 blob an agent reads.
+        let defs: &[(&str, &str, usize, Option<Validator>)] = &[
+            (
+                r"\bsk-(?:proj-|ant-(?:api|admin)\d{2}-|or-v1-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}",
+                "SECRET",
+                0,
+                None,
+            ),
+            (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "SECRET", 0, None),
+            (r"\bgh[pousr]_[A-Za-z0-9]{36,}\b", "SECRET", 0, None),
+            (r"\bgithub_pat_[A-Za-z0-9_]{50,}\b", "SECRET", 0, None),
+            (r"\bxox[abposr]-[A-Za-z0-9-]{10,}", "SECRET", 0, None),
+            (r"\bAIza[0-9A-Za-z_-]{35}", "SECRET", 0, None),
+            (r"\bglpat-[0-9A-Za-z_-]{20,}", "SECRET", 0, None),
+            (r"\b(?:sk|rk)_live_[0-9A-Za-z]{20,}", "SECRET", 0, None),
+            (
+                r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{10,}",
+                "SECRET",
+                0,
+                None,
+            ),
+            (
+                r"-----BEGIN [A-Z ]*PRIVATE KEY-----[A-Za-z0-9+/=\s]*(?:-----END [A-Z ]*PRIVATE KEY-----)?",
+                "SECRET",
+                0,
+                None,
+            ),
+            (
+                r#"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@'"<>]+:([^\s/@'"<>]+)@"#,
+                "SECRET",
+                1,
+                None,
+            ),
+            (
+                r"\b[Bb]earer\s+([A-Za-z0-9._~+/-]{16,}=*)",
+                "SECRET",
+                1,
+                Some(bearer_ok),
+            ),
+            (
+                r#"(?i)\b[a-z0-9_.-]*(?:(?:api|access|private|secret|signing|encryption)[_-]?key|secret|token|password|passwd|credentials?)["']?\s*[:=]\s*["']?([a-z0-9_\-./+=~!@#%^&*]{8,})"#,
+                "SECRET",
+                1,
+                Some(assigned_secret_ok),
+            ),
+            (r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", "EMAIL", 0, Some(email_ok)),
+            (r"\b(?:\d[ -]?){12,18}\d\b", "CARD", 0, Some(card_ok)),
+            (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "IP", 0, Some(ip_ok)),
+            (r"\+?\d[\d ().-]{5,}\d", "PHONE", 0, Some(phone_ok)),
         ];
         Self {
             patterns: defs
                 .iter()
-                .map(|(p, l, v)| (Regex::new(p).expect("builtin pattern is valid"), *l, *v))
+                .map(|&(p, label, group, validator)| Pattern {
+                    re: Regex::new(p).expect("builtin pattern is valid"),
+                    label,
+                    group,
+                    validator,
+                })
                 .collect(),
         }
     }
@@ -240,15 +443,18 @@ impl Default for RegexDetector {
 impl Detector for RegexDetector {
     fn detect(&self, text: &str) -> Vec<Span> {
         let mut spans = Vec::new();
-        for (re, label, validator) in &self.patterns {
-            for m in re.find_iter(text) {
-                if validator.is_some_and(|ok| !ok(m.as_str())) {
+        for p in &self.patterns {
+            for caps in p.re.captures_iter(text) {
+                let Some(m) = caps.get(p.group) else {
+                    continue;
+                };
+                if p.validator.is_some_and(|ok| !ok(text, m.start(), m.end())) {
                     continue;
                 }
                 spans.push(Span {
                     start: m.start(),
                     end: m.end(),
-                    label: (*label).to_string(),
+                    label: p.label.to_string(),
                     source: "regex",
                     score: 0.0,
                 });
