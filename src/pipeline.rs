@@ -1,10 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use regex::Regex;
 use sha2::{Digest, Sha256};
 
-use crate::detect::{detect_windowed, merge, Detector, DictionaryDetector, RegexDetector};
+use crate::detect::{detect_windowed, merge_by, Detector, DictionaryDetector, RegexDetector, Span};
+use crate::jsonview::{self, View};
 use crate::metrics::Metrics;
 use crate::store::Store;
 use crate::vault::Vault;
@@ -40,6 +42,19 @@ fn snap_to_boundaries(seg: &str, start: usize, end: usize) -> Option<(usize, usi
     (start < end).then_some((start, end))
 }
 
+/// A placeholder-shaped token (`<<EMAIL_1`) that is never closed with `>>`.
+///
+/// Only that shape counts. A bare `<<` is ordinary text: shell heredocs (`cat <<EOF`),
+/// C++ streams and bit shifts all have one with no `>>` anywhere in the request.
+fn has_unclosed_placeholder(seg: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"<<\s*[A-Z][A-Z0-9_]*_[0-9]+\s*(>>)?")
+            .expect("placeholder shape regex is valid")
+    });
+    re.captures_iter(seg).any(|c| c.get(1).is_none())
+}
+
 /// Delta-cache size at which it is flushed, so a long-lived proxy cannot grow it
 /// without bound.
 const CACHE_LIMIT: usize = 20_000;
@@ -50,6 +65,18 @@ struct CachedSpan {
     start: usize,
     end: usize,
     label: String,
+    /// Layers of JSON escaping to decode from the raw slice to get the real value: 0
+    /// when the span was found in the raw text, otherwise the depth of the
+    /// [`View`] it was found in. The vault keys on the decoded value, so `José` in a
+    /// message and its escaped form in a JSON tool result get the same placeholder.
+    decode: u8,
+}
+
+impl CachedSpan {
+    /// The real value this span covers in `seg`.
+    fn value<'a>(&self, seg: &'a str) -> std::borrow::Cow<'a, str> {
+        jsonview::unescape_n(&seg[self.start..self.end], self.decode)
+    }
 }
 
 /// Why a scan refused to produce an outbound payload.
@@ -296,6 +323,23 @@ impl Gateway {
         changed
     }
 
+    /// Allow-list `term` in `scope`. A policy change, so the delta cache is cleared
+    /// (invariant 3): cached spans would otherwise keep hiding it.
+    pub fn allow(&mut self, term: &str, scope: &str) {
+        self.store.allow(term, scope);
+        self.cache.clear();
+    }
+
+    /// Remove `term` from the allow-list. Clears the delta cache: a segment cached
+    /// while the term was allowed would otherwise keep sending it unredacted.
+    pub fn unallow_in(&mut self, term: &str, scope: Option<&str>) -> bool {
+        let changed = self.store.unallow_in(term, scope);
+        if changed {
+            self.cache.clear();
+        }
+        changed
+    }
+
     /// Cache key. The scope is part of it: the same text redacts differently for
     /// different scopes, so a hit must never cross one.
     fn hash(scope: Option<&str>, seg: &str) -> String {
@@ -310,6 +354,11 @@ impl Gateway {
     /// builtin patterns, then the optional ML detector. Returns offsets only —
     /// never the matched text — so the result is safe to cache and can be applied
     /// against any session's vault.
+    ///
+    /// When the segment holds JSON escapes (see [`crate::jsonview`]) every layer runs
+    /// over the decoded view, and the dictionary over the raw text as well, so a taught
+    /// term that itself contains a backslash is still caught. View spans are mapped back
+    /// to raw ranges covering whole escape sequences.
     fn detect_spans(
         &mut self,
         scope: Option<&str>,
@@ -317,22 +366,33 @@ impl Gateway {
         seg: &str,
     ) -> (Vec<CachedSpan>, bool) {
         let mut failed = false;
-        let mut spans = dict.detect(seg);
-        spans.extend(self.regexes.detect(seg));
+        let view = View::of(seg);
+        let (text, depth) = match &view {
+            Some(v) => (v.text.as_str(), v.depth),
+            None => (seg, 0),
+        };
+
+        // (span in `text` coordinates, found in the view?)
+        let mut found: Vec<(Span, bool)> = Vec::new();
+        if view.is_some() {
+            found.extend(dict.detect(seg).into_iter().map(|s| (s, false)));
+        }
+        found.extend(dict.detect(text).into_iter().map(|s| (s, true)));
+        found.extend(self.regexes.detect(text).into_iter().map(|s| (s, true)));
         if let Some(extra) = &self.extra {
             // A third-party detector's offsets are not trusted to land on character
             // boundaries: slicing mid-character would panic, and a misaligned span
             // would redact the wrong bytes. Widen to the enclosing boundaries.
             //
-            // The segment goes to the detector in bounded windows, never whole: encoder
+            // The text goes to the detector in bounded windows, never whole: encoder
             // memory is quadratic in input length, so one long tool output would
             // otherwise take the process down.
-            spans.extend(
-                detect_windowed(extra.as_ref(), seg)
+            found.extend(
+                detect_windowed(extra.as_ref(), text)
                     .into_iter()
                     .filter_map(|mut s| {
-                        (s.start, s.end) = snap_to_boundaries(seg, s.start, s.end)?;
-                        Some(s)
+                        (s.start, s.end) = snap_to_boundaries(text, s.start, s.end)?;
+                        Some((s, true))
                     }),
             );
             // Any failed window fails the segment. The metric counts segments, not
@@ -342,20 +402,38 @@ impl Gateway {
                 failed = true;
             }
         }
+
+        // Everything in raw coordinates, so raw and view spans merge correctly.
+        let raw: Vec<(Span, u8)> = found
+            .into_iter()
+            .map(|(mut s, in_view)| match (&view, in_view) {
+                (Some(v), true) => {
+                    (s.start, s.end) = v.to_raw(s.start, s.end);
+                    (s, depth)
+                }
+                _ => (s, 0),
+            })
+            .filter(|(s, _)| s.start < s.end)
+            .collect();
+
         let mut kept = Vec::new();
-        for s in merge(spans) {
-            let real = &seg[s.start..s.end];
-            if self.store.is_allowed_for(scope, real) {
-                continue;
-            }
-            if s.source != "dictionary" && !self.is_known(scope, real) {
-                self.push_suggestion(scope, real);
-            }
-            kept.push(CachedSpan {
+        for (s, decode) in merge_by(raw, |(s, _)| s) {
+            let span = CachedSpan {
                 start: s.start,
                 end: s.end,
                 label: s.label,
-            });
+                decode,
+            };
+            let real = span.value(seg);
+            if self.store.is_allowed_for(scope, &real) {
+                continue;
+            }
+            // Secrets are not candidates for teaching, and must not sit in a list an
+            // admin endpoint returns.
+            if s.source != "dictionary" && span.label != "SECRET" && !self.is_known(scope, &real) {
+                self.push_suggestion(scope, &real);
+            }
+            kept.push(span);
         }
         (kept, failed)
     }
@@ -366,7 +444,7 @@ impl Gateway {
         let mut cursor = 0usize;
         for s in spans {
             out.push_str(&seg[cursor..s.start]);
-            out.push_str(&vault.placeholder_for(&s.label, &seg[s.start..s.end]));
+            out.push_str(&vault.placeholder_for(&s.label, &s.value(seg)));
             cursor = s.end;
         }
         out.push_str(&seg[cursor..]);
@@ -492,11 +570,39 @@ impl Gateway {
     /// Index of the first segment that still contains a protected term, if any.
     /// Lets a caller say *where* a block happened without echoing the term.
     pub fn first_residual_term(&self, scope: Option<&str>, segments: &[String]) -> Option<usize> {
+        self.residual(scope, segments, true)
+    }
+
+    /// The taught-term check over one already-serialized body, on the raw text only.
+    ///
+    /// The proxy checks every decoded string of the body (and its JSON view) one by one
+    /// first; this second pass over the whole serialized body must not also build a
+    /// decoded view of it, which would hold several copies of a large request in
+    /// memory under the gateway lock.
+    pub fn assert_clean_serialized(&self, scope: Option<&str>, body: &str) -> Result<(), String> {
+        let seg = [body.to_string()];
+        if self.residual(scope, &seg, false).is_some() {
+            return Err("residual protected term in outbound".into());
+        }
+        if has_unclosed_placeholder(body) {
+            return Err("malformed placeholder in outbound".into());
+        }
+        Ok(())
+    }
+
+    fn residual(&self, scope: Option<&str>, segments: &[String], decode: bool) -> Option<usize> {
         let dict = self.dictionary(scope);
+        let found_in = |text: &str| {
+            dict.detect(text).iter().any(|span| {
+                !self
+                    .store
+                    .is_allowed_for(scope, &text[span.start..span.end])
+            })
+        };
+        // The decoded view too: a term after a JSON `\n`, or written with `\u` escapes,
+        // is invisible to a match on the raw text.
         segments.iter().position(|seg| {
-            dict.detect(seg)
-                .iter()
-                .any(|span| !self.store.is_allowed_for(scope, &seg[span.start..span.end]))
+            found_in(seg) || (decode && View::of(seg).is_some_and(|v| found_in(&v.text)))
         })
     }
 
@@ -506,10 +612,8 @@ impl Gateway {
         outbound: &[String],
     ) -> Result<(), String> {
         self.assert_no_terms_scoped(scope, outbound)?;
-        for seg in outbound {
-            if seg.contains("<<") && !seg.contains(">>") {
-                return Err("malformed placeholder in outbound".into());
-            }
+        if outbound.iter().any(|seg| has_unclosed_placeholder(seg)) {
+            return Err("malformed placeholder in outbound".into());
         }
         Ok(())
     }

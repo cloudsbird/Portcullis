@@ -55,6 +55,19 @@ impl Vault {
     /// The provider may reformat `<<EMAIL_1>>`; we match `<<  email_1  >>` too.
     /// One pass over the text, whatever the number of placeholders.
     pub fn restore(&self, text: &str) -> String {
+        self.restore_as(text, false)
+    }
+
+    /// [`Vault::restore`] for text that is itself JSON, such as tool-call `arguments`:
+    /// each real value is inserted JSON-escaped, so a value holding a quote, a
+    /// backslash or a newline cannot break the client's parse. A placeholder in JSON
+    /// text always sits inside a string literal.
+    pub fn restore_json(&self, text: &str) -> String {
+        self.restore_as(text, true)
+    }
+
+    /// [`Vault::restore`] or [`Vault::restore_json`].
+    pub fn restore_as(&self, text: &str, json: bool) -> String {
         if self.ph_to_real.is_empty() {
             return text.to_string();
         }
@@ -62,11 +75,22 @@ impl Vault {
             .replace_all(text, |caps: &regex::Captures| {
                 let inner = caps[1].trim().to_uppercase();
                 match self.ph_to_real.get(&inner) {
+                    Some(real) if json => crate::jsonview::escape(real),
                     Some(real) => real.clone(),
                     None => caps[0].to_string(),
                 }
             })
             .into_owned()
+    }
+
+    /// How many distinct values were hidden under each label.
+    pub fn label_counts(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for inner in self.ph_to_real.keys() {
+            let label = inner.rsplit_once('_').map_or(inner.as_str(), |(l, _)| l);
+            *counts.entry(label.to_string()).or_insert(0) += 1;
+        }
+        counts
     }
 
     pub fn is_empty(&self) -> bool {

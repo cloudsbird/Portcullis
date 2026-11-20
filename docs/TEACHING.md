@@ -16,7 +16,7 @@ There is no model training anywhere in the loop. Portcullis detects in three lay
 | Layer | Catches | Nature |
 |---|---|---|
 | **Dictionary** (what you taught) | exactly your terms, and only those | **exact, deterministic** |
-| **Regex** | email, phone, card-like, IP | exact for known shapes |
+| **Regex** | email, phone, card-like, IP, secrets (API keys, tokens, private keys, credentials in URLs and config) | exact for known shapes |
 | **ONNX model** | names, orgs, addresses you never mentioned | best-effort recall |
 
 The model is the *fuzzy* layer — it guesses. The dictionary is the *guarantee*. When you

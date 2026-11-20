@@ -1,5 +1,7 @@
 //! Placeholder-level carry buffer shared by both SSE paths.
 
+use std::collections::BTreeMap;
+
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -15,13 +17,19 @@ pub(super) const MAX_PENDING: usize = 256;
 #[derive(Default)]
 pub(super) struct StreamCarry {
     pub(super) content: String,
-    pub(super) args: String,
+    /// OpenAI tool-call `arguments`, by tool-call `index`. Parallel calls stream
+    /// interleaved, so one shared buffer would stitch the start of a placeholder from
+    /// one call onto the next call's arguments.
+    pub(super) args: BTreeMap<u64, String>,
     /// Reasoning/thinking keeps its own buffer. Two text fields interleave in one
     /// stream, so stitching a split placeholder across them would corrupt both.
     pub(super) reasoning: String,
     /// OpenRouter's `reasoning` delta. Separate from `reasoning_content` because a
     /// gateway may stream both side by side.
     pub(super) reasoning_alt: String,
+    /// Anthropic content blocks, by block `index`: whether the block streams JSON
+    /// (`input_json_delta`), and its held text.
+    pub(super) blocks: BTreeMap<u64, (bool, String)>,
 }
 
 /// Split `combined` into (safe to emit, holds back a partial placeholder).
@@ -39,8 +47,14 @@ pub(super) fn split_partial_placeholder(combined: &str) -> (&str, &str) {
 }
 
 /// Rehydrate `text`, prepending and updating the carry buffer so a placeholder
-/// split across events is restored as a single unit.
-pub(super) fn rehydrate_with_carry(text: &str, pending: &mut String, vault: &Vault) -> String {
+/// split across events is restored as a single unit. `json`: the text is JSON (tool
+/// arguments), so values are inserted escaped (see [`Vault::restore_json`]).
+pub(super) fn rehydrate_with_carry(
+    text: &str,
+    pending: &mut String,
+    vault: &Vault,
+    json: bool,
+) -> String {
     let combined = format!("{pending}{text}");
     let (emit, held) = split_partial_placeholder(&combined);
     let (emit, held) = if held.len() > MAX_PENDING {
@@ -51,7 +65,7 @@ pub(super) fn rehydrate_with_carry(text: &str, pending: &mut String, vault: &Vau
     };
     let emit_owned = emit.to_string();
     *pending = held.to_string();
-    vault.restore(&emit_owned)
+    vault.restore_as(&emit_owned, json)
 }
 
 /// Accumulates raw SSE bytes and yields whole events.

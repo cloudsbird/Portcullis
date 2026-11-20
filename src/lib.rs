@@ -17,6 +17,7 @@ pub mod crypt;
 pub mod detect;
 #[cfg(feature = "onnx")]
 pub mod detect_onnx;
+pub mod jsonview;
 pub mod metrics;
 pub mod model;
 pub mod pipeline;

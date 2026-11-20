@@ -195,7 +195,7 @@ pub async fn chat_completions(
 ) -> Response {
     match handle(state, headers, body).await {
         Ok(resp) => resp,
-        Err((status, msg)) => (status, msg).into_response(),
+        Err((status, msg)) => error_response(Dialect::OpenAi, status, msg),
     }
 }
 
@@ -229,6 +229,11 @@ pub(super) async fn handle(
         let mut msg = msg.clone();
         collect_message_texts(&mut msg, &mut texts_to_redact);
         redacted_messages.push(msg);
+    }
+    // Tool definitions are text the provider reads too (see `collect_descriptions`).
+    let mut redacted_tools = body.get("tools").cloned();
+    if let Some(tools) = redacted_tools.as_mut() {
+        collect_descriptions(tools, &mut texts_to_redact);
     }
 
     // Redact all text-bearing strings in one batch (better cache hit rate).
@@ -269,10 +274,16 @@ pub(super) async fn handle(
         for msg in &mut redacted_messages {
             replace_message_texts(msg, &redacted_texts, &mut idx);
         }
+        if let Some(tools) = redacted_tools.as_mut() {
+            replace_descriptions(tools, &redacted_texts, &mut idx);
+        }
     }
 
     let mut upstream_body = body.clone();
     upstream_body["messages"] = json!(redacted_messages);
+    if let Some(tools) = redacted_tools {
+        upstream_body["tools"] = tools;
+    }
 
     // Invariant 4: fail-closed outbound assertion — run over the ENTIRE assembled
     // payload, not only the strings we knew to redact. If the walker failed to
@@ -400,10 +411,11 @@ pub(super) async fn stream_response(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// Emit any held-back text as a final synthetic delta event.
+/// Emit any held-back text as a final synthetic delta event, each tool call's held
+/// arguments under its own `index`.
 pub(super) fn flush_carry(carry: &mut StreamCarry, vault: &Vault) -> String {
     if carry.content.is_empty()
-        && carry.args.is_empty()
+        && carry.args.values().all(String::is_empty)
         && carry.reasoning.is_empty()
         && carry.reasoning_alt.is_empty()
     {
@@ -434,14 +446,17 @@ pub(super) fn flush_carry(carry: &mut StreamCarry, vault: &Vault) -> String {
             "finish_reason": null
         }));
     }
-    if !carry.args.is_empty() {
-        let held = std::mem::take(&mut carry.args);
+    let calls: Vec<Value> = std::mem::take(&mut carry.args)
+        .into_iter()
+        .filter(|(_, held)| !held.is_empty())
+        .map(|(index, held)| {
+            json!({ "index": index, "function": { "arguments": vault.restore_json(&held) } })
+        })
+        .collect();
+    if !calls.is_empty() {
         deltas.push(json!({
             "index": 0,
-            "delta": { "tool_calls": [ {
-                "index": 0,
-                "function": { "arguments": vault.restore(&held) }
-            } ] },
+            "delta": { "tool_calls": calls },
             "finish_reason": null
         }));
     }
@@ -496,19 +511,20 @@ pub(super) fn rehydrate_sse_delta(value: &mut Value, carry: &mut StreamCarry, va
             continue;
         };
         if let Some(Value::String(content)) = delta.get_mut("content") {
-            let rehydrated = rehydrate_with_carry(content, &mut carry.content, vault);
+            let rehydrated = rehydrate_with_carry(content, &mut carry.content, vault, false);
             *content = rehydrated;
         }
         // Reasoning models stream a second text field. Without this, a
         // placeholder the model *reasoned* about comes back to the client as a
         // literal `<<ORG_1>>`.
         if let Some(Value::String(reasoning)) = delta.get_mut("reasoning_content") {
-            let rehydrated = rehydrate_with_carry(reasoning, &mut carry.reasoning, vault);
+            let rehydrated = rehydrate_with_carry(reasoning, &mut carry.reasoning, vault, false);
             *reasoning = rehydrated;
         }
         // OpenRouter streams reasoning as `reasoning` instead.
         if let Some(Value::String(reasoning)) = delta.get_mut("reasoning") {
-            let rehydrated = rehydrate_with_carry(reasoning, &mut carry.reasoning_alt, vault);
+            let rehydrated =
+                rehydrate_with_carry(reasoning, &mut carry.reasoning_alt, vault, false);
             *reasoning = rehydrated;
         }
         if let Some(tool_calls) = delta.get_mut("tool_calls") {
@@ -532,23 +548,30 @@ pub(super) fn rehydrate_response_message(msg: &mut Value, vault: &Vault) {
                 .get_mut("function")
                 .and_then(|f| f.get_mut("arguments"))
             {
-                *args = vault.restore(args);
+                *args = vault.restore_json(args);
             }
         }
     }
 }
 
-pub(super) fn rehydrate_tool_calls(tool_calls: &mut Value, pending: &mut String, vault: &Vault) {
+/// Rehydrate streamed tool-call arguments, holding a split placeholder per call
+/// `index` and inserting values JSON-escaped.
+pub(super) fn rehydrate_tool_calls(
+    tool_calls: &mut Value,
+    pending: &mut std::collections::BTreeMap<u64, String>,
+    vault: &Vault,
+) {
     let Some(calls) = tool_calls.as_array_mut() else {
         return;
     };
     for call in calls.iter_mut() {
+        let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
         let Some(func) = call.get_mut("function") else {
             continue;
         };
         if let Some(Value::String(args)) = func.get_mut("arguments") {
-            let rehydrated = rehydrate_with_carry(args, pending, vault);
-            *args = rehydrated;
+            let held = pending.entry(index).or_default();
+            *args = rehydrate_with_carry(args, held, vault, true);
         }
     }
 }

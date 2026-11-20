@@ -53,7 +53,8 @@ Portcullis is a security tool, so its own posture matters as much as its functio
 
 **The proxy endpoints are deliberately unauthenticated.** `/v1/chat/completions` and
 `/v1/messages` accept anyone who can reach the port, and forward using *your* provider
-key. Only the admin surface (`/teach`, `/unteach`, `/terms`, `/suggestions`) requires a
+key. Only the admin surface (`/teach`, `/unteach`, `/terms`, `/suggestions`, `/allow`,
+`/unallow`, `/scan`) requires a
 bearer token. The intended deployment is loopback, beside your client. Binding it to a
 LAN or public interface is a security decision, not a configuration detail — put
 authentication in front of it first. See
@@ -228,7 +229,12 @@ Four invariants are enforced as tests in
    to block the request instead (503).
 
 Detection runs in three layers, merged with a fixed priority (dictionary → regex → model),
-so the ML layer can only *add* recall and can never override a deterministic match.
+so the ML layer can only *add* recall and can never override a deterministic match. The
+regex layer covers emails, phones, cards, IPs and secrets (API keys, tokens, private keys),
+and is tuned to leave timestamps, loopback addresses, package pins and hashes alone, so an
+agent can still read its own logs ([OPERATIONS.md](docs/OPERATIONS.md#what-the-patterns-hide-and-what-they-leave-alone)).
+JSON sent as text (tool results, tool-call arguments) is scanned in decoded form, so an
+escaped newline cannot hide a term and placeholders keep the JSON valid.
 
 LLM APIs are stateless: every turn, the client re-sends the whole conversation. Portcullis
 scans only the **delta** and re-emits unchanged segments **byte-identically**, so it stays
@@ -331,7 +337,7 @@ invalidation, rehydration, fail-closed — which is what `tests/invariants.rs` c
 
 Usable today for a single user, on loopback, in front of your own traffic.
 
-**Verified:** 86 tests by default (**89** with `--features onnx`), run on every push. The
+**Verified:** 132 tests by default (**135** with `--features onnx`), run on every push. The
 safety contract in `tests/invariants.rs`, the OpenAI and Anthropic proxy paths, SSE
 streaming including placeholders split across events, the hardening surface (timeouts,
 body limits, health, store permissions), and a golden test proving the Rust ONNX detector
@@ -396,6 +402,9 @@ All of these are stated in full, with reproduction steps, in
 | `POST` | `/unteach` | bearer | remove a term |
 | `GET` | `/terms` | bearer | list the store |
 | `GET` | `/suggestions` | bearer | terms detected but not yet taught |
+| `POST` | `/allow` | bearer | never redact a term (a value the model needs to see) |
+| `POST` | `/unallow` | bearer | take a term off the allow-list |
+| `POST` | `/scan` | bearer | show a text as the provider would receive it, with counts per label |
 | `GET` | `/healthz` | none | liveness; returns counts only, never a term or a value |
 | `GET` | `/metrics` | open or bearer | Prometheus metrics ([OPERATIONS.md](docs/OPERATIONS.md#metrics)) |
 
@@ -417,9 +426,9 @@ Issues and pull requests are welcome. For anything substantial, please open an i
 first so the approach can be agreed before code is written.
 
 ```bash
-cargo test                                  # 86 tests
+cargo test                                  # 132 tests
 cargo build --features onnx
-PORTCULLIS_MODEL_DIR=./model cargo test --features onnx    # 89
+PORTCULLIS_MODEL_DIR=./model cargo test --features onnx    # 135
 ```
 
 Two conventions worth knowing before you send a patch:
