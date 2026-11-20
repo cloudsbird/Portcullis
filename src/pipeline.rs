@@ -323,6 +323,23 @@ impl Gateway {
         changed
     }
 
+    /// Allow-list `term` in `scope`. A policy change, so the delta cache is cleared
+    /// (invariant 3): cached spans would otherwise keep hiding it.
+    pub fn allow(&mut self, term: &str, scope: &str) {
+        self.store.allow(term, scope);
+        self.cache.clear();
+    }
+
+    /// Remove `term` from the allow-list. Clears the delta cache: a segment cached
+    /// while the term was allowed would otherwise keep sending it unredacted.
+    pub fn unallow_in(&mut self, term: &str, scope: Option<&str>) -> bool {
+        let changed = self.store.unallow_in(term, scope);
+        if changed {
+            self.cache.clear();
+        }
+        changed
+    }
+
     /// Cache key. The scope is part of it: the same text redacts differently for
     /// different scopes, so a hit must never cross one.
     fn hash(scope: Option<&str>, seg: &str) -> String {

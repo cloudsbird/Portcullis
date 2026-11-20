@@ -347,7 +347,9 @@ pub fn route_label(path: &str) -> &'static str {
     match path {
         "/v1/chat/completions" => "openai",
         "/v1/messages" => "anthropic",
-        "/teach" | "/unteach" | "/terms" | "/suggestions" => "admin",
+        "/teach" | "/unteach" | "/terms" | "/suggestions" | "/allow" | "/unallow" | "/scan" => {
+            "admin"
+        }
         "/healthz" => "health",
         "/metrics" => "metrics",
         _ => "other",

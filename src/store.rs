@@ -182,6 +182,36 @@ impl Store {
         before != self.deny.len()
     }
 
+    /// Add `term` to the allow-list for `scope`: never redacted there, whichever
+    /// detector finds it. Idempotent by (term, scope).
+    pub fn allow(&mut self, term: &str, scope: &str) {
+        if self
+            .allow
+            .iter()
+            .any(|e| e.term.eq_ignore_ascii_case(term) && e.scope.eq_ignore_ascii_case(scope))
+        {
+            return;
+        }
+        self.allow.push(Entry {
+            term: term.to_string(),
+            label: "ALLOW".into(),
+            scope: scope.to_string(),
+            aliases: Vec::new(),
+            source: "user".into(),
+            whole_word: false,
+        });
+    }
+
+    /// Remove `term` from the allow-list, in one scope or (`None`) all of them.
+    pub fn unallow_in(&mut self, term: &str, scope: Option<&str>) -> bool {
+        let before = self.allow.len();
+        self.allow.retain(|e| {
+            !(e.term.eq_ignore_ascii_case(term)
+                && scope.is_none_or(|s| e.scope.eq_ignore_ascii_case(s)))
+        });
+        before != self.allow.len()
+    }
+
     pub fn is_allowed(&self, term: &str) -> bool {
         self.is_allowed_for(None, term)
     }

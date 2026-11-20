@@ -1,4 +1,5 @@
-//! In-chat learning surface: `/teach`, `/unteach`, `/terms`, `/suggestions`.
+//! In-chat learning surface: `/teach`, `/unteach`, `/terms`, `/suggestions`, the
+//! allow-list (`/allow`, `/unallow`) and `/scan`.
 
 use super::*;
 
@@ -21,6 +22,21 @@ pub(super) struct TeachRequest {
 pub(super) struct UnteachRequest {
     term: String,
     /// Remove only from this scope. Omitted: remove from every scope.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct AllowRequest {
+    term: String,
+    #[serde(default = "default_scope")]
+    scope: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ScanRequest {
+    text: String,
+    /// Scan as a request in this scope would be. Omitted: every term applies.
     #[serde(default)]
     scope: Option<String>,
 }
@@ -218,9 +234,80 @@ pub(super) async fn terms_handler(State(state): State<ProxyState>, headers: Head
         .store
         .deny
         .iter()
-        .map(|e| json!({"term": e.term, "label": e.label, "scope": e.scope}))
+        .map(|e| {
+            json!({"term": e.term, "label": e.label, "scope": e.scope, "whole_word": e.whole_word})
+        })
         .collect();
-    Json(json!({ "terms": terms })).into_response()
+    let allow: Vec<Value> = gw
+        .store
+        .allow
+        .iter()
+        .map(|e| json!({"term": e.term, "scope": e.scope}))
+        .collect();
+    Json(json!({ "terms": terms, "allow": allow })).into_response()
+}
+
+/// `POST /allow {"term", "scope"?}`: never redact `term` (in `scope`, default global).
+/// For values the model needs to see, such as an internal host the agent manages.
+pub(super) async fn allow_handler(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    Json(req): Json<AllowRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers) {
+        return e.into_response();
+    }
+    let (term, scope) = (req.term.clone(), req.scope.clone());
+    match mutate_store(&state, move |gw| gw.allow(&term, &scope)).await {
+        Ok(()) => Json(json!({ "ok": true, "allowed": req.term })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /unallow {"term", "scope"?}`: take `term` off the allow-list.
+pub(super) async fn unallow_handler(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    Json(req): Json<UnteachRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers) {
+        return e.into_response();
+    }
+    let (term, scope) = (req.term.clone(), req.scope.clone());
+    match mutate_store(&state, move |gw| gw.unallow_in(&term, scope.as_deref())).await {
+        Ok(removed) => Json(json!({ "ok": true, "removed": removed })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /scan {"text", "scope"?}`: the text as the provider would receive it, with a
+/// count of hidden values per label. Runs the live dictionary, patterns and detector.
+/// Returns nothing the caller did not send: placeholders and counts only.
+pub(super) async fn scan_handler(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    Json(req): Json<ScanRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers) {
+        return e.into_response();
+    }
+    let gateway = state.gateway.clone();
+    let scanned = tokio::task::spawn_blocking(move || {
+        let mut gw = gateway.blocking_lock();
+        let mut vault = crate::Vault::new();
+        let out = gw.process_scoped(req.scope.as_deref(), &mut vault, &[req.text]);
+        (
+            out.into_iter().next().unwrap_or_default(),
+            vault.label_counts(),
+        )
+    })
+    .await;
+    match scanned {
+        Ok((redacted, counts)) => {
+            Json(json!({ "redacted": redacted, "counts": counts })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// `GET /suggestions[?scope=NAME]`: all candidates, or only those seen in one scope's

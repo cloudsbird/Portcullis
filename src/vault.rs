@@ -83,6 +83,16 @@ impl Vault {
             .into_owned()
     }
 
+    /// How many distinct values were hidden under each label.
+    pub fn label_counts(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for inner in self.ph_to_real.keys() {
+            let label = inner.rsplit_once('_').map_or(inner.as_str(), |(l, _)| l);
+            *counts.entry(label.to_string()).or_insert(0) += 1;
+        }
+        counts
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ph_to_real.is_empty()
     }

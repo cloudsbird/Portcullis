@@ -506,3 +506,116 @@ async fn anthropic_stream_flushes_each_block_before_it_stops() {
     let input: Value = serde_json::from_str(&json1).expect("tool input stays valid JSON");
     assert_eq!(input["to"], r#"Dana "DJ" Smith"#);
 }
+
+async fn admin_harness(store: Store) -> (Client, String, std::path::PathBuf) {
+    let dir =
+        std::env::temp_dir().join(format!("pc-admin-{}-{}", std::process::id(), rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store_path = dir.join("store.json");
+    store.save_with(&store_path, None).unwrap();
+    let client = Client::new();
+    let mut state = ProxyState::new(
+        Gateway::new(store),
+        client.clone(),
+        "http://127.0.0.1:9/v1/chat/completions".into(),
+        String::new(),
+    );
+    state.admin_token = Some("admintok".into());
+    state.store_path = Some(store_path.to_string_lossy().into_owned());
+    (client, spawn(portcullis::proxy::app(state)).await, dir)
+}
+
+fn rand_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
+/// `/scan` shows what the provider would see, for `portcullis-ctl test`. It needs the
+/// admin token and returns placeholders and counts, never a value it was not given.
+#[tokio::test]
+async fn scan_shows_what_the_provider_would_see() {
+    let (client, base, _dir) = admin_harness(taught(&[("Cartalian", "ORG")])).await;
+    let url = format!("{base}/scan");
+    let body =
+        json!({"text": "Cartalian: mail jane@acme.io, key sk-proj-abc123DEF456ghi789JKL012mno345"});
+
+    let anon = client.post(&url).json(&body).send().await.unwrap();
+    assert_eq!(anon.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let resp = client
+        .post(&url)
+        .bearer_auth("admintok")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["redacted"],
+        "<<ORG_1>>: mail <<EMAIL_1>>, key <<SECRET_1>>"
+    );
+    assert_eq!(v["counts"], json!({"ORG": 1, "EMAIL": 1, "SECRET": 1}));
+}
+
+/// The allow-list over HTTP: a value you want the model to see (an internal IP your
+/// agent manages) stops being redacted at once, and `/unallow` brings it back. Both
+/// are persisted, and listed by `/terms`.
+#[tokio::test]
+async fn allow_and_unallow_take_effect_immediately_and_persist() {
+    let (client, base, dir) = admin_harness(Store::default()).await;
+    let scan = |text: &'static str| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            let v: Value = client
+                .post(format!("{base}/scan"))
+                .bearer_auth("admintok")
+                .json(&json!({ "text": text }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            v["redacted"].as_str().unwrap().to_string()
+        }
+    };
+    assert_eq!(scan("ssh 10.0.1.3").await, "ssh <<IP_1>>");
+
+    let r = client
+        .post(format!("{base}/allow"))
+        .bearer_auth("admintok")
+        .json(&json!({"term": "10.0.1.3"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    assert_eq!(scan("ssh 10.0.1.3").await, "ssh 10.0.1.3");
+
+    let terms: Value = client
+        .get(format!("{base}/terms"))
+        .bearer_auth("admintok")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(terms["allow"][0]["term"], "10.0.1.3", "{terms}");
+    let saved = Store::load_with(dir.join("store.json"), None).unwrap();
+    assert!(saved.is_allowed("10.0.1.3"), "allow-list was not saved");
+
+    let r = client
+        .post(format!("{base}/unallow"))
+        .bearer_auth("admintok")
+        .json(&json!({"term": "10.0.1.3"}))
+        .send()
+        .await
+        .unwrap();
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["removed"], true);
+    assert_eq!(scan("ssh 10.0.1.3").await, "ssh <<IP_1>>");
+    let _ = std::fs::remove_dir_all(dir);
+}
